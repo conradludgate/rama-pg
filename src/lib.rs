@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! rama-pg: a Postgres wire-protocol proxy built on [rama](https://ramaproxy.org).
+//!
+//! The proxy is a single L4 [`rama::Service`] over a `TcpStream`. It performs
+//! Postgres' non-standard pre-TLS `SSLRequest` shim, upgrades the same socket to
+//! TLS via rama's acceptor, parses the `StartupMessage`, and (incrementally)
+//! authenticates and forwards to a backend.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod protocol;
+pub mod proxy;
