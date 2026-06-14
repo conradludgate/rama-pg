@@ -85,11 +85,18 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 
 ## Not yet implemented
 
-- More auth mechanisms: mTLS and `OAUTHBEARER`. (JWT-over-cleartext needs no
-  built-in mechanism — supply a `PasswordValidator` that verifies the token
-  against JWKS.) The `cleartext` mechanism still terminates to a trust backend
-  (only SCRAM does upstream reauth); SASLprep password normalisation is future
-  work. Concrete `ScramSecretStore` / `PasswordValidator` implementations (live
+- **mTLS (client certificates) is blocked on rama 0.3.** The rustls acceptor
+  discards the client cert (`NegotiatedTlsParameters { peer_certificate_chain:
+  None, .. }`) and `TlsAcceptorDataBuilder` only exposes `with_no_client_auth()`,
+  so the proxy never sees a cert to map to an identity. A clean fix is small and
+  upstream (the acceptor already holds the rustls connection — it just needs to
+  read `peer_certificates()`); the alternative is a raw-rustls escape hatch that
+  leaks TLS internals into the session. Deferred pending an upstream discussion.
+- More auth mechanisms: `OAUTHBEARER`. (JWT-over-cleartext needs no built-in
+  mechanism — supply a `PasswordValidator` that verifies the token against
+  JWKS.) The `cleartext` mechanism still terminates to a trust backend (only
+  SCRAM does upstream reauth); SASLprep password normalisation is future work.
+  Concrete `ScramSecretStore` / `PasswordValidator` implementations (live
   `pg_authid`, a control plane, JWKS fetching) are intentionally left to the
   user behind the async traits.
 - Session / transaction pooling (return the backend to a pool at transaction
