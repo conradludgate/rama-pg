@@ -40,6 +40,12 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
      (`-PLUS`) is not offered.
 6. **Direct 1:1 proxy** — forward the `StartupMessage` verbatim, then
    `tokio::io::copy_bidirectional`.
+7. **Transaction pooling** (optional) — multiplex clients over a shared pool of
+   backend connections, checked out per transaction and returned at
+   `ReadyForQuery` status `I` (tracked via a cancel-safe `FramedReader` relay).
+   The proxy terminates auth, synthesizes the client's startup from the pool's
+   captured `ParameterStatus`, and discards a backend left mid-transaction so no
+   state leaks between clients. v1: a single backend, no sharding.
 
 ## Run
 
@@ -59,6 +65,10 @@ RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
 RAMA_PG_AUTH=scram \
   RAMA_PG_SCRAM_SECRETS="alice=SCRAM-SHA-256\$4096:<salt>\$<stored>:<server>" \
   RAMA_PG_BACKEND=127.0.0.1:5433 cargo run -p rama-pg-example
+
+# transaction pooling: many clients multiplexed over 8 backend connections
+RAMA_PG_POOL_SIZE=8 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
+  RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
 ```
 
 Connect through it (SNI comes from the host name; `hostaddr` keeps the dial on
@@ -79,6 +89,7 @@ psql "host=db.example.com hostaddr=127.0.0.1 port=6432 \
 | `RAMA_PG_AUTH`    | `passthrough`, `cleartext`, or `scram`              | `passthrough`      |
 | `RAMA_PG_USERS`   | `user:password` pairs separated by `;` (cleartext)  | —                  |
 | `RAMA_PG_SCRAM_SECRETS` | `user=SCRAM-SHA-256$…` verifiers, `;`-separated (scram) | —          |
+| `RAMA_PG_POOL_SIZE` | max pooled backend connections; enables transaction pooling | — (direct) |
 
 TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 (which encrypts without verifying the certificate).
@@ -99,9 +110,11 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
   Concrete `ScramSecretStore` / `PasswordValidator` implementations (live
   `pg_authid`, a control plane, JWKS fetching) are intentionally left to the
   user behind the async traits.
-- Session / transaction pooling (return the backend to a pool at transaction
-  boundaries by tracking the `ReadyForQuery` status `I`/`T`/`E`) and read-only
-  sharding (primary/replica split).
+- Pooling beyond v1: per-`(user, database)` pools and non-trust backends (the
+  pool can't satisfy a credential challenge yet), backpressure tuning, server
+  reset/`DISCARD ALL` reuse instead of discarding a dirty connection, and
+  correctness under cross-transaction pipelining. Read-only sharding
+  (primary/replica split) builds on this.
 - `CancelRequest` routing — it arrives on a *separate* connection carrying a
   PID + secret and must reach the same backend, so it needs a cancel-key map.
 - Direct-TLS (ALPN, client skips `SSLRequest`) and SCRAM-SHA-256-PLUS channel
@@ -113,9 +126,10 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
 `rama-pg-example` binary crate that wires it up.
 
 - `src/protocol/` — wire types: `startup` (SSLRequest / StartupMessage /
-  CancelRequest), `codec` (tagged frames + the `read_message` reader),
-  `message` (server-message builders).
+  CancelRequest), `codec` (tagged frames, `read_message`, and the cancel-safe
+  `FramedReader`), `message` (server-message builders).
 - `src/route.rs` — the SNI router.
+- `src/pool.rs` — the backend connection pool for transaction pooling.
 - `src/auth.rs` — the `Authenticator` trait, the `ClientAuth`/`BackendAuth`
   outcomes, the pass-through mechanism, and cleartext termination over a
   pluggable async `PasswordValidator`.

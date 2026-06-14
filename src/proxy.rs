@@ -18,8 +18,9 @@ use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use crate::auth::{AuthContext, Authenticator, BackendAuth, ClientAuth};
+use crate::pool::BackendPool;
 use crate::protocol::codec::{self, read_message};
-use crate::protocol::message::fatal_error;
+use crate::protocol::message::{authentication_ok, backend_key_data, fatal_error, ready_for_query};
 use crate::protocol::startup::{StartupRequest, read_startup_frame, read_startup_request};
 use crate::route::Router;
 
@@ -30,12 +31,18 @@ pub struct PgProxy<A> {
 
 impl<A: Authenticator> PgProxy<A> {
     /// Build a proxy that terminates TLS with the given acceptor data, routes
-    /// on `router`, and authenticates clients with `auth`.
-    pub fn new(tls: TlsAcceptorData, router: Arc<Router>, auth: Arc<A>) -> Self {
+    /// on `router`, and authenticates clients with `auth`. When `pool` is set,
+    /// the proxy runs in transaction-pooling mode instead of direct 1:1.
+    pub fn new(
+        tls: TlsAcceptorData,
+        router: Arc<Router>,
+        auth: Arc<A>,
+        pool: Option<Arc<BackendPool>>,
+    ) -> Self {
         // `store_client_hello = true` so the SNI is captured into the TLS
         // stream's extensions for routing.
         Self {
-            tls: TlsAcceptorService::new(tls, PgSession::new(router, auth), true),
+            tls: TlsAcceptorService::new(tls, PgSession::new(router, auth, pool), true),
         }
     }
 }
@@ -94,11 +101,12 @@ where
 pub struct PgSession<A> {
     router: Arc<Router>,
     auth: Arc<A>,
+    pool: Option<Arc<BackendPool>>,
 }
 
 impl<A> PgSession<A> {
-    pub fn new(router: Arc<Router>, auth: Arc<A>) -> Self {
-        Self { router, auth }
+    pub fn new(router: Arc<Router>, auth: Arc<A>, pool: Option<Arc<BackendPool>>) -> Self {
+        Self { router, auth, pool }
     }
 }
 
@@ -154,6 +162,12 @@ where
             sni: sni.as_deref(),
         };
         let outcome = self.auth.authenticate(&mut stream, &auth_ctx).await?;
+
+        // Transaction-pooling mode: multiplex over a shared backend pool instead
+        // of dialing a dedicated 1:1 connection.
+        if let Some(pool) = self.pool.clone() {
+            return serve_pooled(stream, &startup_frame, outcome, pool).await;
+        }
 
         let mut upstream = match TokioTcpStream::connect(&address).await {
             Ok(stream) => stream,
@@ -226,6 +240,132 @@ where
                 return Err("backend rejected startup".into());
             }
             _ => client.write_all(msg.as_bytes()).await?,
+        }
+    }
+}
+
+/// Transaction-pooling session: the proxy terminated the client's auth, so it
+/// synthesizes the startup completion (from the pool's captured
+/// `ParameterStatus`) and then multiplexes the client's transactions over the
+/// shared backend pool, checking a backend out per transaction and returning it
+/// at `ReadyForQuery` status `I`.
+///
+/// v1 limitation: aggressive pipelining across a transaction boundary (sending
+/// the next transaction's commands before the prior `ReadyForQuery`) is not
+/// handled — clients that wait for `ReadyForQuery` (psql, libpq, most drivers)
+/// behave correctly.
+async fn serve_pooled<C>(
+    mut stream: C,
+    startup_frame: &[u8],
+    outcome: ClientAuth,
+    pool: Arc<BackendPool>,
+) -> Result<(), BoxError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    if matches!(outcome, ClientAuth::PassThrough) {
+        return reject(
+            &mut stream,
+            "0A000",
+            "rama-pg: pooling requires a terminating auth mode (cleartext or scram)",
+        )
+        .await;
+    }
+
+    // Establish a backend once (capturing ParameterStatus), then release it —
+    // the client is idle until it sends a query.
+    pool.checkout(startup_frame).await?.checkin();
+
+    // Synthesize the startup completion to the client.
+    stream.write_all(&authentication_ok()).await?;
+    for param in pool.params() {
+        stream.write_all(&param).await?;
+    }
+    stream
+        .write_all(&backend_key_data(rand::random(), rand::random()))
+        .await?;
+    stream.write_all(&ready_for_query(b'I')).await?;
+    stream.flush().await?;
+
+    let mut client = codec::FramedReader::new(stream);
+    loop {
+        // Idle: wait for the client to begin a transaction.
+        let Some(first) = client.read_frame().await? else {
+            break;
+        };
+        if first.tag() == codec::TERMINATE {
+            break;
+        }
+
+        let mut backend = pool.checkout(startup_frame).await?;
+        backend.stream().write_all(first.as_bytes()).await?;
+        backend.stream().flush().await?;
+
+        match relay_transaction(&mut client, backend.stream()).await? {
+            TxnEnd::Complete => backend.checkin(),
+            TxnEnd::ClientGone => {
+                backend.discard();
+                break;
+            }
+        }
+    }
+
+    tracing::info!("pooled session closed");
+    Ok(())
+}
+
+/// Why a pooled transaction relay ended.
+enum TxnEnd {
+    /// The backend reached `ReadyForQuery` idle — it can be returned to the pool.
+    Complete,
+    /// The client disconnected; the backend is mid-transaction and discarded.
+    ClientGone,
+}
+
+/// Relay one transaction between the client and a checked-out backend, watching
+/// the backend's `ReadyForQuery` to detect the transaction boundary.
+async fn relay_transaction<C>(
+    client: &mut codec::FramedReader<C>,
+    backend: &mut TokioTcpStream,
+) -> Result<TxnEnd, BoxError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut backend = codec::FramedReader::new(backend);
+    loop {
+        tokio::select! {
+            // Prefer draining the backend so a final ReadyForQuery is handled
+            // before forwarding any further client input.
+            biased;
+            backend_frame = backend.read_frame() => {
+                let Some(msg) = backend_frame? else {
+                    return Err("backend closed mid-transaction".into());
+                };
+                client.get_mut().write_all(msg.as_bytes()).await?;
+                match msg.tag() {
+                    codec::READY_FOR_QUERY => {
+                        client.get_mut().flush().await?;
+                        if msg.payload().first() == Some(&b'I') {
+                            return Ok(TxnEnd::Complete);
+                        }
+                    }
+                    codec::ERROR_RESPONSE => client.get_mut().flush().await?,
+                    _ => {}
+                }
+            }
+            client_frame = client.read_frame() => {
+                match client_frame? {
+                    None => return Ok(TxnEnd::ClientGone),
+                    Some(msg) => {
+                        if msg.tag() == codec::TERMINATE {
+                            backend.get_mut().write_all(msg.as_bytes()).await.ok();
+                            return Ok(TxnEnd::ClientGone);
+                        }
+                        backend.get_mut().write_all(msg.as_bytes()).await?;
+                        backend.get_mut().flush().await?;
+                    }
+                }
+            }
         }
     }
 }

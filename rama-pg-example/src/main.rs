@@ -13,6 +13,7 @@ use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
+use rama_pg::pool::BackendPool;
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
 use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
@@ -35,7 +36,8 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let auth = Arc::new(build_auth());
-    let proxy = Arc::new(PgProxy::new(tls, router, auth));
+    let pool = build_pool();
+    let proxy = Arc::new(PgProxy::new(tls, router, auth, pool));
 
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");
@@ -46,6 +48,24 @@ async fn main() -> Result<(), BoxError> {
         .await;
 
     Ok(())
+}
+
+/// Build the backend pool when transaction pooling is enabled:
+///
+/// - `RAMA_PG_POOL_SIZE` — max backend connections; enables pooling when set.
+///
+/// The pool targets `RAMA_PG_BACKEND` (single backend, no sharding in v1).
+fn build_pool() -> Option<Arc<BackendPool>> {
+    let size: usize = env::var("RAMA_PG_POOL_SIZE").ok()?.parse().ok()?;
+    let address = match env::var("RAMA_PG_BACKEND") {
+        Ok(address) => address,
+        Err(_) => {
+            tracing::warn!("RAMA_PG_POOL_SIZE set but RAMA_PG_BACKEND missing; pooling disabled");
+            return None;
+        }
+    };
+    tracing::info!(size, %address, "transaction pooling enabled");
+    Some(BackendPool::new(address, size))
 }
 
 /// Build the SNI router from environment configuration:
