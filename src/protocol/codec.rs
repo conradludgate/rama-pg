@@ -98,6 +98,72 @@ pub fn frame(tag: u8, body: &[u8]) -> BytesMut {
     out
 }
 
+/// A buffered, **cancel-safe** frame reader.
+///
+/// Unlike [`read_message`], `read_frame` can be used in a `tokio::select!` arm:
+/// any partially-read bytes live in the persistent buffer (filled via the
+/// cancel-safe `read_buf`), so a cancelled read never drops data mid-frame.
+/// This is what makes the bidirectional pooling relay correct.
+#[derive(Debug)]
+pub struct FramedReader<R> {
+    inner: R,
+    buf: BytesMut,
+}
+
+impl<R: AsyncRead + Unpin> FramedReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: BytesMut::new(),
+        }
+    }
+
+    /// Mutable access to the underlying stream (e.g. to write to it).
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Read one frame, `None` at a clean end of stream. Cancel-safe.
+    pub async fn read_frame(&mut self) -> io::Result<Option<RawMessage>> {
+        loop {
+            if let Some(frame) = take_frame(&mut self.buf)? {
+                return Ok(Some(frame));
+            }
+            if self.inner.read_buf(&mut self.buf).await? == 0 {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream ended mid-message",
+                    ))
+                };
+            }
+        }
+    }
+}
+
+/// Split off a complete frame from `buf` if one is fully buffered.
+fn take_frame(buf: &mut BytesMut) -> io::Result<Option<RawMessage>> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let len = i32::from_be_bytes(buf[1..5].try_into().unwrap());
+    if !(4..=MAX_MESSAGE_LEN).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid message length {len} for tag {:?}", buf[0] as char),
+        ));
+    }
+    let total = 1 + len as usize;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    Ok(Some(RawMessage {
+        frame: buf.split_to(total),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +182,22 @@ mod tests {
         // tag 'Q', length 3 (< 4).
         let bytes = [QUERY, 0, 0, 0, 3];
         assert!(read_message(&mut &bytes[..]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn framed_reader_splits_consecutive_frames() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&frame(QUERY, b"select 1\0"));
+        stream.extend_from_slice(&frame(READY_FOR_QUERY, b"I"));
+        let bytes = stream.to_vec();
+
+        let mut reader = FramedReader::new(&bytes[..]);
+        let first = reader.read_frame().await.unwrap().unwrap();
+        assert_eq!(first.tag(), QUERY);
+        assert_eq!(first.payload(), b"select 1\0");
+        let second = reader.read_frame().await.unwrap().unwrap();
+        assert_eq!(second.tag(), READY_FOR_QUERY);
+        assert_eq!(second.payload(), b"I");
+        assert!(reader.read_frame().await.unwrap().is_none()); // clean EOF
     }
 }

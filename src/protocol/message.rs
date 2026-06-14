@@ -6,7 +6,7 @@
 
 use bytes::{BufMut, BytesMut};
 
-use super::codec::{AUTHENTICATION, ERROR_RESPONSE, frame};
+use super::codec::{AUTHENTICATION, BACKEND_KEY_DATA, ERROR_RESPONSE, READY_FOR_QUERY, frame};
 
 /// `Authentication` sub-type: the request succeeded (`AuthenticationOk`).
 const AUTH_OK: i32 = 0;
@@ -59,6 +59,20 @@ fn sasl_message(subtype: i32, data: &[u8]) -> BytesMut {
     body.put_i32(subtype);
     body.extend_from_slice(data);
     frame(AUTHENTICATION, &body)
+}
+
+/// Build a `BackendKeyData` frame (the PID + secret used for `CancelRequest`).
+/// In pooling mode the proxy issues its own, since backends are shared.
+pub fn backend_key_data(process_id: i32, secret_key: i32) -> BytesMut {
+    let mut body = BytesMut::with_capacity(8);
+    body.put_i32(process_id);
+    body.put_i32(secret_key);
+    frame(BACKEND_KEY_DATA, &body)
+}
+
+/// Build a `ReadyForQuery` frame with the given transaction status (`I`/`T`/`E`).
+pub fn ready_for_query(status: u8) -> BytesMut {
+    frame(READY_FOR_QUERY, &[status])
 }
 
 /// Build a fatal `ErrorResponse` frame.
