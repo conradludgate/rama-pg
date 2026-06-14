@@ -95,10 +95,12 @@ RAMA_PG_CUSTOM=1 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
 The `pgbouncer` crate composes the above into a small pgbouncer-alike: SCRAM
 auth with verifiers fetched from `pg_authid` on demand, pooling (session /
 transaction / statement), and an admin console on the `pgbouncer` database
-answering `SHOW POOLS` / `CLIENTS` / `STATS` / `LISTS` / `VERSION`.
+answering `SHOW POOLS` / `CLIENTS` / `STATS` / `LISTS` / `VERSION`. It is
+configured by a **pgbouncer-style INI file** (`[databases]` backend connstring +
+`[pgbouncer]` settings) — see `pgbouncer/pgbouncer.ini`.
 
 ```sh
-RAMA_PG_BACKEND=127.0.0.1:5434 RAMA_PG_POOL_MODE=transaction cargo run -p pgbouncer
+cargo run -p pgbouncer -- pgbouncer/pgbouncer.ini
 # real database — SCRAM auth (verifier from pg_authid), then pooled:
 psql "host=h hostaddr=127.0.0.1 port=6432 user=alice dbname=shop sslmode=require"
 # admin console:
@@ -185,4 +187,5 @@ A Cargo workspace: the `rama-pg` library at the root, plus two example binaries.
 - `rama-pg-example/` — the runnable proxy binary (env-driven configuration).
 - `pgbouncer/` — a pgbouncer-like example composing it all via
   `PgProxy::with_forwarder`: a database-routing forwarder (admin console vs.
-  pool), `pg_authid` SCRAM auth, pooling modes, and `SHOW` commands.
+  pool), `pg_authid` SCRAM auth, pooling modes, and `SHOW` commands. Configured
+  by a `pgbouncer.ini` (a small hand-rolled INI parser in `config.rs`).

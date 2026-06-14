@@ -9,11 +9,11 @@
 //!   mode (session / transaction / statement).
 //! - Live-ish **admin stats** shared between the pool path and the console.
 //!
-//! Config (env): `RAMA_PG_LISTEN`, `RAMA_PG_BACKEND` (also the `pg_authid`
-//! source), `RAMA_PG_REPLICAS`, `RAMA_PG_POOL_SIZE`, `RAMA_PG_POOL_MODE`,
-//! `RAMA_PG_ADMIN_USER`, `RAMA_PG_ADMIN_DB`.
+//! Config: a pgbouncer-style INI file (path as argv[1], default `pgbouncer.ini`)
+//! — see `config.rs` and the sample `pgbouncer.ini`.
 
-use std::env;
+mod config;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,8 @@ use rama_pg::scram::{PgAuthidStore, ScramSha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing_subscriber::EnvFilter;
 
+use crate::config::Config;
+
 /// The special database whose connections get the admin console.
 const ADMIN_DB: &str = "pgbouncer";
 
@@ -43,41 +45,43 @@ async fn main() -> Result<(), BoxError> {
         )
         .init();
 
-    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?.build();
+    let path = std::env::args().nth(1).unwrap_or_else(|| "pgbouncer.ini".to_owned());
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+    let config = Config::from_ini(&text)?;
 
-    let backend = env::var("RAMA_PG_BACKEND").unwrap_or_else(|_| "127.0.0.1:5434".to_owned());
-    let admin_user = env::var("RAMA_PG_ADMIN_USER").unwrap_or_else(|_| "postgres".to_owned());
-    let admin_db = env::var("RAMA_PG_ADMIN_DB").unwrap_or_else(|_| "postgres".to_owned());
-    let max_size: usize = env::var("RAMA_PG_POOL_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let mode = match env::var("RAMA_PG_POOL_MODE").as_deref() {
-        Ok("session") => PoolMode::Session,
-        Ok("statement") => PoolMode::Statement,
-        _ => PoolMode::Transaction,
-    };
-    let replicas: Vec<String> = match env::var("RAMA_PG_REPLICAS") {
-        Ok(list) => list.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
-        Err(_) => vec![backend.clone()],
-    };
+    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?.build();
 
     // SCRAM auth, verifier fetched from pg_authid over an admin connection.
     let auth = Arc::new(ScramSha256::new(PgAuthidStore::new(
-        backend.clone(),
-        admin_user,
-        admin_db,
+        config.backend.clone(),
+        config.auth_user.clone(),
+        config.auth_dbname.clone(),
     )));
 
-    let stats = Arc::new(Stats::new(mode, max_size, replicas.clone()));
+    let stats = Arc::new(Stats::new(
+        config.pool_mode,
+        config.pool_size,
+        vec![config.backend.clone()],
+    ));
     let forwarder = PgBouncerForwarder {
         admin: CustomForwarder::new(Arc::new(AdminConsole { stats: stats.clone() })),
-        pool: PooledForwarder::new(BackendPool::new(replicas, max_size, mode)),
+        pool: PooledForwarder::new(BackendPool::new(
+            vec![config.backend.clone()],
+            config.pool_size,
+            config.pool_mode,
+        )),
         stats,
     };
 
     let proxy = Arc::new(PgProxy::with_forwarder(tls, auth, forwarder));
-    let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
-    tracing::info!(%listen, %backend, ?mode, "pgbouncer-like proxy listening");
+    tracing::info!(
+        listen = %config.listen,
+        backend = %config.backend,
+        mode = ?config.pool_mode,
+        "pgbouncer-like proxy listening (config: {path})",
+    );
 
-    TcpListener::bind_address(listen.as_str(), Executor::new())
+    TcpListener::bind_address(config.listen.as_str(), Executor::new())
         .await?
         .serve(proxy)
         .await;
