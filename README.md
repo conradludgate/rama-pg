@@ -161,5 +161,9 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
 - `src/scram/` — SCRAM-SHA-256: `crypto` (primitives + key recovery), `secret`
   (the verifier + async `ScramSecretStore`), the server-side authenticator
   (`mod.rs`), and `client` (upstream reauth).
-- `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth → forward.
+- `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth, then a
+  forwarding **leaf `rama::Service`** over a `PgClient`. The three modes
+  (`DirectForwarder` / `PooledForwarder` / `CustomForwarder`) are `Service`
+  impls selected via `BoxService`; `PgProxy::with_forwarder` takes any
+  `Service<PgClient<…>>`, so a new mode is "write a `Service`", not a new branch.
 - `rama-pg-example/` — the runnable proxy binary (env-driven configuration).

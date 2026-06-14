@@ -9,10 +9,12 @@
 
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use rama::Service;
 use rama::error::BoxError;
 use rama::extensions::ExtensionsRef;
 use rama::net::tls::SecureTransport;
+use rama::service::BoxService;
 use rama::tcp::{TcpStream, TokioTcpStream};
 use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
@@ -24,9 +26,178 @@ use crate::protocol::message::{
     authentication_ok, backend_key_data, command_complete, data_row, error_response, fatal_error,
     parameter_status, ready_for_query, row_description,
 };
-use crate::protocol::startup::{StartupRequest, read_startup_frame, read_startup_request};
+use crate::protocol::startup::{
+    StartupMessage, StartupRequest, read_startup_frame, read_startup_request,
+};
 use crate::query::{QueryContext, QueryHandler, QueryResponse, SessionState, TxnStatus};
 use crate::route::Router;
+
+/// The forwarding leaf's input: an authenticated client ready for its session.
+///
+/// The shared front matter — TLS, `StartupMessage`, and auth — has already
+/// happened; a *forwarder* takes it from here. Forwarders are plain
+/// [`rama::Service`]s over a `PgClient`, so each mode (direct, pooled, custom)
+/// is just a `Service` impl and a new one is "write a `Service`", selected at
+/// construction via [`rama::service::BoxService`].
+pub struct PgClient<IO> {
+    /// The (TLS) client stream.
+    pub stream: IO,
+    /// The raw `StartupMessage` frame, for replaying to a backend verbatim.
+    pub startup_frame: BytesMut,
+    /// The parsed startup parameters.
+    pub startup: StartupMessage,
+    /// The TLS SNI, if the client sent one.
+    pub sni: Option<String>,
+    /// How the client authenticated — decides backend handling.
+    pub auth: ClientAuth,
+}
+
+/// A boxed forwarding leaf operating on the proxy's concrete client stream.
+pub type Forwarder = BoxService<PgClient<TlsStream<TcpStream>>, (), BoxError>;
+
+/// Direct 1:1 forwarding: resolve the backend from the SNI, replay the startup,
+/// satisfy backend auth (pass-through / trust / SCRAM reauth), then relay bytes.
+pub struct DirectForwarder {
+    router: Arc<Router>,
+}
+
+impl DirectForwarder {
+    pub fn new(router: Arc<Router>) -> Self {
+        Self { router }
+    }
+}
+
+impl<IO> Service<PgClient<IO>> for DirectForwarder
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Output = ();
+    type Error = BoxError;
+
+    async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
+        let PgClient {
+            mut stream,
+            startup_frame,
+            startup,
+            sni,
+            auth,
+        } = client;
+
+        let Some(backend) = self.router.route(sni.as_deref()) else {
+            tracing::info!(?sni, user = ?startup.user(), "no backend route for SNI");
+            return reject(
+                &mut stream,
+                "08004",
+                "rama-pg: no backend configured for this server name",
+            )
+            .await;
+        };
+        let address = backend.address.clone();
+        tracing::info!(
+            ?sni,
+            user = ?startup.user(),
+            database = ?startup.database(),
+            backend = %address,
+            "routing connection",
+        );
+
+        let mut upstream = match TokioTcpStream::connect(&address).await {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                tracing::error!(%address, %err, "failed to connect to backend");
+                return reject(&mut stream, "08006", "rama-pg: could not reach backend").await;
+            }
+        };
+        // Replay the StartupMessage verbatim to the backend.
+        upstream.write_all(&startup_frame).await?;
+        upstream.flush().await?;
+
+        // In terminate mode we authenticated the client ourselves, so satisfy
+        // the backend's auth and splice its startup result (AuthenticationOk,
+        // ParameterStatus, …, ReadyForQuery) to the client before relaying.
+        match auth {
+            ClientAuth::PassThrough => {}
+            ClientAuth::Terminated(BackendAuth::Trust) => {
+                relay_backend_startup(&mut stream, &mut upstream).await?;
+            }
+            ClientAuth::Terminated(BackendAuth::Scram(keys)) => {
+                crate::scram::reauth_upstream(&mut upstream, &keys).await?;
+                relay_backend_startup(&mut stream, &mut upstream).await?;
+            }
+        }
+
+        let (client_to_backend, backend_to_client) =
+            copy_bidirectional(&mut stream, &mut upstream).await?;
+        tracing::info!(client_to_backend, backend_to_client, "session closed");
+        Ok(())
+    }
+}
+
+/// Transaction-pooling forwarding (with round-robin replica sharding).
+pub struct PooledForwarder {
+    pool: Arc<BackendPool>,
+}
+
+impl PooledForwarder {
+    pub fn new(pool: Arc<BackendPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl<IO> Service<PgClient<IO>> for PooledForwarder
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Output = ();
+    type Error = BoxError;
+
+    async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
+        let PgClient {
+            stream,
+            startup_frame,
+            startup,
+            sni,
+            auth,
+        } = client;
+        let user = startup.user().unwrap_or_default().to_owned();
+        let database = startup.database().unwrap_or_default().to_owned();
+        tracing::info!(?sni, user, database, "pooled connection");
+        serve_pooled(stream, &startup_frame, &user, &database, auth, self.pool.clone()).await
+    }
+}
+
+/// Custom forwarding: answer queries in-proxy with no backend at all.
+pub struct CustomForwarder {
+    handler: Arc<dyn QueryHandler>,
+}
+
+impl CustomForwarder {
+    pub fn new(handler: Arc<dyn QueryHandler>) -> Self {
+        Self { handler }
+    }
+}
+
+impl<IO> Service<PgClient<IO>> for CustomForwarder
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Output = ();
+    type Error = BoxError;
+
+    async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
+        let PgClient {
+            stream,
+            startup,
+            sni,
+            auth,
+            ..
+        } = client;
+        let user = startup.user().unwrap_or_default().to_owned();
+        let database = startup.database().unwrap_or_default().to_owned();
+        tracing::info!(?sni, user, "custom query session");
+        serve_custom(stream, &user, &database, auth, self.handler.clone()).await
+    }
+}
 
 /// Top-level proxy service operating on a raw [`TcpStream`].
 pub struct PgProxy<A> {
@@ -34,10 +205,10 @@ pub struct PgProxy<A> {
 }
 
 impl<A: Authenticator> PgProxy<A> {
-    /// Build a proxy that terminates TLS with the given acceptor data, routes
-    /// on `router`, and authenticates clients with `auth`. The mode is chosen by
-    /// the optional `handler` (custom in-proxy queries, no backend) and `pool`
-    /// (transaction pooling); with neither, it is direct 1:1.
+    /// Build a proxy that terminates TLS with the given acceptor data and
+    /// authenticates clients with `auth`. The forwarding mode is chosen by the
+    /// optional `handler` (custom in-proxy queries, no backend) and `pool`
+    /// (transaction pooling); with neither, it is direct 1:1 on `router`.
     pub fn new(
         tls: TlsAcceptorData,
         router: Arc<Router>,
@@ -45,10 +216,26 @@ impl<A: Authenticator> PgProxy<A> {
         pool: Option<Arc<BackendPool>>,
         handler: Option<Arc<dyn QueryHandler>>,
     ) -> Self {
+        let forwarder = if let Some(handler) = handler {
+            CustomForwarder::new(handler).boxed()
+        } else if let Some(pool) = pool {
+            PooledForwarder::new(pool).boxed()
+        } else {
+            DirectForwarder::new(router).boxed()
+        };
+        Self::with_forwarder(tls, auth, forwarder)
+    }
+
+    /// Build a proxy with a caller-supplied forwarding [`Service`] — the
+    /// composability seam for new modes beyond the built-in three.
+    pub fn with_forwarder<F>(tls: TlsAcceptorData, auth: Arc<A>, forwarder: F) -> Self
+    where
+        F: Service<PgClient<TlsStream<TcpStream>>, Output = (), Error = BoxError>,
+    {
         // `store_client_hello = true` so the SNI is captured into the TLS
         // stream's extensions for routing.
         Self {
-            tls: TlsAcceptorService::new(tls, PgSession::new(router, auth, pool, handler), true),
+            tls: TlsAcceptorService::new(tls, PgSession::new(auth, forwarder.boxed()), true),
         }
     }
 }
@@ -101,29 +288,17 @@ where
     }
 }
 
-/// Handles a single connection once TLS is established: reads the
-/// `StartupMessage`, resolves a backend from the SNI, authenticates the client,
-/// and forwards to the backend (direct 1:1).
+/// Runs the shared post-TLS front matter — read the `StartupMessage`, capture
+/// the SNI, authenticate — then hands an authenticated [`PgClient`] to the
+/// forwarding leaf.
 pub struct PgSession<A> {
-    router: Arc<Router>,
     auth: Arc<A>,
-    pool: Option<Arc<BackendPool>>,
-    handler: Option<Arc<dyn QueryHandler>>,
+    forwarder: Forwarder,
 }
 
 impl<A> PgSession<A> {
-    pub fn new(
-        router: Arc<Router>,
-        auth: Arc<A>,
-        pool: Option<Arc<BackendPool>>,
-        handler: Option<Arc<dyn QueryHandler>>,
-    ) -> Self {
-        Self {
-            router,
-            auth,
-            pool,
-            handler,
-        }
+    fn new(auth: Arc<A>, forwarder: Forwarder) -> Self {
+        Self { auth, forwarder }
     }
 }
 
@@ -146,7 +321,7 @@ where
 
         // Keep the raw frame so it can be replayed to the backend verbatim.
         let startup_frame = read_startup_frame(&mut stream).await?;
-        let msg = match StartupRequest::parse(&startup_frame)? {
+        let startup = match StartupRequest::parse(&startup_frame)? {
             StartupRequest::Startup(msg) => msg,
             other => {
                 tracing::warn!(?other, "unexpected message after TLS handshake");
@@ -154,76 +329,23 @@ where
             }
         };
 
-        // Authenticate the client; the outcome decides how we reach the backend.
+        // Authenticate the client; the outcome decides how the forwarder reaches
+        // the backend.
         let auth_ctx = AuthContext {
-            startup: &msg,
+            startup: &startup,
             sni: sni.as_deref(),
         };
-        let outcome = self.auth.authenticate(&mut stream, &auth_ctx).await?;
-        let user = msg.user().unwrap_or_default().to_owned();
-        let database = msg.database().unwrap_or_default().to_owned();
+        let auth = self.auth.authenticate(&mut stream, &auth_ctx).await?;
 
-        // Custom-query mode answers in-proxy with no backend at all.
-        if let Some(handler) = self.handler.clone() {
-            tracing::info!(?sni, user, "custom query session");
-            return serve_custom(stream, &user, &database, outcome, handler).await;
-        }
-
-        // Transaction-pooling mode bypasses SNI→backend routing: the pool's
-        // replicas are the destination.
-        if let Some(pool) = self.pool.clone() {
-            tracing::info!(?sni, user, database, "pooled connection");
-            return serve_pooled(stream, &startup_frame, &user, &database, outcome, pool).await;
-        }
-
-        // Direct 1:1 mode: resolve the backend from the SNI.
-        let Some(backend) = self.router.route(sni.as_deref()) else {
-            tracing::info!(?sni, user = ?msg.user(), "no backend route for SNI");
-            return reject(
-                &mut stream,
-                "08004",
-                "rama-pg: no backend configured for this server name",
-            )
-            .await;
-        };
-        let address = backend.address.clone();
-        tracing::info!(
-            ?sni,
-            user = ?msg.user(),
-            database = ?msg.database(),
-            backend = %address,
-            "routing connection",
-        );
-
-        let mut upstream = match TokioTcpStream::connect(&address).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                tracing::error!(%address, %err, "failed to connect to backend");
-                return reject(&mut stream, "08006", "rama-pg: could not reach backend").await;
-            }
-        };
-        // Replay the StartupMessage verbatim to the backend.
-        upstream.write_all(&startup_frame).await?;
-        upstream.flush().await?;
-
-        // In terminate mode we authenticated the client ourselves, so satisfy
-        // the backend's auth and splice its startup result (AuthenticationOk,
-        // ParameterStatus, …, ReadyForQuery) to the client before relaying.
-        match outcome {
-            ClientAuth::PassThrough => {}
-            ClientAuth::Terminated(BackendAuth::Trust) => {
-                relay_backend_startup(&mut stream, &mut upstream).await?;
-            }
-            ClientAuth::Terminated(BackendAuth::Scram(keys)) => {
-                crate::scram::reauth_upstream(&mut upstream, &keys).await?;
-                relay_backend_startup(&mut stream, &mut upstream).await?;
-            }
-        }
-
-        let (client_to_backend, backend_to_client) =
-            copy_bidirectional(&mut stream, &mut upstream).await?;
-        tracing::info!(client_to_backend, backend_to_client, "session closed");
-        Ok(())
+        self.forwarder
+            .serve(PgClient {
+                stream,
+                startup_frame,
+                startup,
+                sni,
+                auth,
+            })
+            .await
     }
 }
 
