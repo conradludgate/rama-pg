@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
-use crate::pool::{BackendPool, PoolMode};
+use crate::pool::{BackendPool, Lease, PoolMode};
 use crate::protocol::codec;
 
 /// Transaction-pooling forwarding (with round-robin replica sharding).
@@ -74,12 +74,14 @@ where
         // One backend for the whole connection — relay opaquely until disconnect.
         PoolMode::Session => {
             let mut lease = pool.lease(startup_frame, user, database).await?;
-            let (client_to_backend, backend_to_client) =
-                copy_bidirectional(&mut stream, &mut lease).await?;
+            let outcome = copy_bidirectional(&mut stream, &mut lease).await;
+            // The relay is opaque, so we can't prove the backend ended at an idle
+            // boundary (the client may have bailed mid-query), and there's no
+            // server reset — so never re-pool a session backend; discard it.
+            // (Real session-pool *reuse* needs a `DISCARD ALL` reset hook.)
+            lease.discard();
+            let (client_to_backend, backend_to_client) = outcome?;
             tracing::info!(client_to_backend, backend_to_client, "session-pooled connection closed");
-            // NOTE: no server reset (DISCARD ALL) before reuse — a real pooler
-            // would run server_reset_query here.
-            lease.checkin();
             Ok(())
         }
         mode => relay_pooled(stream, startup_frame, user, database, pool, mode).await,
@@ -87,7 +89,7 @@ where
 }
 
 /// Transaction/statement pooling: lease a backend per transaction (or
-/// statement), relaying until the appropriate `ReadyForQuery` boundary.
+/// statement) and run it to its release boundary via [`run_lease`].
 async fn relay_pooled<C>(
     stream: C,
     startup_frame: &[u8],
@@ -109,38 +111,78 @@ where
             break;
         }
 
-        let mut lease = pool.lease(startup_frame, user, database).await?;
-        lease.write_all(first.as_bytes()).await?;
-        lease.flush().await?;
-
-        // Relay until this lease's release boundary.
-        loop {
-            let Some(status) = relay_to_next_rfq(&mut client, &mut lease).await? else {
-                lease.discard(); // client gone mid-statement
-                return Ok(());
-            };
-            match mode {
-                PoolMode::Transaction if status == b'I' => {
-                    lease.checkin();
-                    break;
-                }
-                // Still inside a transaction block — keep this backend.
-                PoolMode::Transaction => {}
-                PoolMode::Statement if status == b'I' => {
-                    lease.checkin();
-                    break;
-                }
-                PoolMode::Statement => {
-                    tracing::warn!("statement mode: discarding backend left in a transaction");
-                    lease.discard();
-                    break;
-                }
-                PoolMode::Session => unreachable!("session mode handled separately"),
-            }
+        let lease = pool.lease(startup_frame, user, database).await?;
+        if !run_lease(&mut client, lease, first.as_bytes(), mode).await? {
+            break; // client gone
         }
     }
 
     tracing::info!("pooled session closed");
+    Ok(())
+}
+
+/// Run one checked-out backend to its release boundary, owning the lease so the
+/// re-pooling decision happens in exactly one place.
+///
+/// **Safety invariant:** the lease is checked back in *only* on a verified idle
+/// `ReadyForQuery` (`b'I'`); every other exit — an IO error, the client going
+/// away, or a backend left mid-transaction — `discard`s it. rama's pool returns
+/// a dropped `LeasedConnection` to the pool unconditionally, so without this a
+/// desynced backend could be re-pooled and leak the previous client's leftover
+/// result frames to the next client of the same `(user, database)`.
+///
+/// Returns `Ok(true)` to keep serving the client, `Ok(false)` once it has gone.
+async fn run_lease<C>(
+    client: &mut codec::FramedReader<C>,
+    mut lease: Lease,
+    first: &[u8],
+    mode: PoolMode,
+) -> Result<bool, BoxError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    // Forward the first frame of the transaction/statement.
+    if let Err(err) = forward_first(&mut lease, first).await {
+        lease.discard();
+        return Err(err);
+    }
+
+    loop {
+        match relay_to_next_rfq(client, &mut lease).await {
+            Err(err) => {
+                lease.discard();
+                return Err(err);
+            }
+            Ok(None) => {
+                lease.discard(); // client gone mid-statement
+                return Ok(false);
+            }
+            // Verified idle: the only safe point to return the backend.
+            Ok(Some(b'I')) => {
+                lease.checkin();
+                return Ok(true);
+            }
+            Ok(Some(_)) => match mode {
+                // Still inside a transaction block — keep relaying on this backend.
+                PoolMode::Transaction => {}
+                // Statement mode forbids multi-statement transactions; the backend
+                // is mid-transaction, so it cannot be reused — discard it.
+                PoolMode::Statement => {
+                    tracing::warn!("statement mode: discarding backend left in a transaction");
+                    lease.discard();
+                    return Ok(true);
+                }
+                PoolMode::Session => unreachable!("session mode handled separately"),
+            },
+        }
+    }
+}
+
+/// Write the first client frame to the backend (split out so [`run_lease`] can
+/// discard the lease on a write error).
+async fn forward_first(lease: &mut Lease, frame: &[u8]) -> Result<(), BoxError> {
+    lease.write_all(frame).await?;
+    lease.flush().await?;
     Ok(())
 }
 
