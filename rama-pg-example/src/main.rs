@@ -15,7 +15,7 @@ use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
-use rama_pg::pool::BackendPool;
+use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::PgProxy;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 use rama_pg::route::{Backend, Router};
@@ -108,8 +108,13 @@ fn build_pool() -> Option<Arc<BackendPool>> {
         tracing::warn!("RAMA_PG_POOL_SIZE set but no RAMA_PG_REPLICAS/RAMA_PG_BACKEND; pooling disabled");
         return None;
     }
-    tracing::info!(size, ?replicas, "transaction pooling enabled");
-    Some(BackendPool::new(replicas, size))
+    let mode = match env::var("RAMA_PG_POOL_MODE").as_deref() {
+        Ok("session") => PoolMode::Session,
+        Ok("statement") => PoolMode::Statement,
+        _ => PoolMode::Transaction,
+    };
+    tracing::info!(size, ?replicas, ?mode, "pooling enabled");
+    Some(BackendPool::new(replicas, size, mode))
 }
 
 /// Build the SNI router from environment configuration:

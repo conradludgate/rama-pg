@@ -20,7 +20,7 @@ use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use crate::auth::{AuthContext, Authenticator, BackendAuth, ClientAuth};
-use crate::pool::BackendPool;
+use crate::pool::{BackendPool, PoolMode};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message::{
     authentication_ok, backend_key_data, command_complete, data_row, error_response, fatal_error,
@@ -437,9 +437,38 @@ where
     stream.write_all(&ready_for_query(b'I')).await?;
     stream.flush().await?;
 
+    match pool.mode() {
+        // One backend for the whole connection — relay opaquely until disconnect.
+        PoolMode::Session => {
+            let mut lease = pool.lease(startup_frame, user, database).await?;
+            let (client_to_backend, backend_to_client) =
+                copy_bidirectional(&mut stream, &mut lease).await?;
+            tracing::info!(client_to_backend, backend_to_client, "session-pooled connection closed");
+            // NOTE: no server reset (DISCARD ALL) before reuse — a real pooler
+            // would run server_reset_query here.
+            lease.checkin();
+            Ok(())
+        }
+        mode => relay_pooled(stream, startup_frame, user, database, pool, mode).await,
+    }
+}
+
+/// Transaction/statement pooling: lease a backend per transaction (or
+/// statement), relaying until the appropriate `ReadyForQuery` boundary.
+async fn relay_pooled<C>(
+    stream: C,
+    startup_frame: &[u8],
+    user: &str,
+    database: &str,
+    pool: Arc<BackendPool>,
+    mode: PoolMode,
+) -> Result<(), BoxError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let mut client = codec::FramedReader::new(stream);
     loop {
-        // Idle: wait for the client to begin a transaction.
+        // Idle: wait for the client to begin a transaction/statement.
         let Some(first) = client.read_frame().await? else {
             break;
         };
@@ -451,11 +480,29 @@ where
         lease.write_all(first.as_bytes()).await?;
         lease.flush().await?;
 
-        match relay_transaction(&mut client, &mut lease).await? {
-            TxnEnd::Complete => lease.checkin(),
-            TxnEnd::ClientGone => {
-                lease.discard();
-                break;
+        // Relay until this lease's release boundary.
+        loop {
+            let Some(status) = relay_to_next_rfq(&mut client, &mut lease).await? else {
+                lease.discard(); // client gone mid-statement
+                return Ok(());
+            };
+            match mode {
+                PoolMode::Transaction if status == b'I' => {
+                    lease.checkin();
+                    break;
+                }
+                // Still inside a transaction block — keep this backend.
+                PoolMode::Transaction => {}
+                PoolMode::Statement if status == b'I' => {
+                    lease.checkin();
+                    break;
+                }
+                PoolMode::Statement => {
+                    tracing::warn!("statement mode: discarding backend left in a transaction");
+                    lease.discard();
+                    break;
+                }
+                PoolMode::Session => unreachable!("session mode handled separately"),
             }
         }
     }
@@ -464,20 +511,13 @@ where
     Ok(())
 }
 
-/// Why a pooled transaction relay ended.
-enum TxnEnd {
-    /// The backend reached `ReadyForQuery` idle — it can be returned to the pool.
-    Complete,
-    /// The client disconnected; the backend is mid-transaction and discarded.
-    ClientGone,
-}
-
-/// Relay one transaction between the client and a checked-out backend, watching
-/// the backend's `ReadyForQuery` to detect the transaction boundary.
-async fn relay_transaction<C, B>(
+/// Relay between the client and a checked-out backend until the backend's next
+/// `ReadyForQuery`, returning its transaction-status byte (`I`/`T`/`E`), or
+/// `None` if the client disconnected first.
+async fn relay_to_next_rfq<C, B>(
     client: &mut codec::FramedReader<C>,
     backend: &mut B,
-) -> Result<TxnEnd, BoxError>
+) -> Result<Option<u8>, BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -485,20 +525,18 @@ where
     let mut backend = codec::FramedReader::new(backend);
     loop {
         tokio::select! {
-            // Prefer draining the backend so a final ReadyForQuery is handled
-            // before forwarding any further client input.
+            // Prefer draining the backend so a ReadyForQuery is handled before
+            // forwarding any further client input.
             biased;
             backend_frame = backend.read_frame() => {
                 let Some(msg) = backend_frame? else {
-                    return Err("backend closed mid-transaction".into());
+                    return Err("backend closed mid-statement".into());
                 };
                 client.get_mut().write_all(msg.as_bytes()).await?;
                 match msg.tag() {
                     codec::READY_FOR_QUERY => {
                         client.get_mut().flush().await?;
-                        if msg.payload().first() == Some(&b'I') {
-                            return Ok(TxnEnd::Complete);
-                        }
+                        return Ok(Some(msg.payload().first().copied().unwrap_or(b'I')));
                     }
                     codec::ERROR_RESPONSE => client.get_mut().flush().await?,
                     _ => {}
@@ -506,11 +544,11 @@ where
             }
             client_frame = client.read_frame() => {
                 match client_frame? {
-                    None => return Ok(TxnEnd::ClientGone),
+                    None => return Ok(None),
                     Some(msg) => {
                         if msg.tag() == codec::TERMINATE {
                             backend.get_mut().write_all(msg.as_bytes()).await.ok();
-                            return Ok(TxnEnd::ClientGone);
+                            return Ok(None);
                         }
                         backend.get_mut().write_all(msg.as_bytes()).await?;
                         backend.get_mut().flush().await?;

@@ -134,10 +134,24 @@ impl ReqToConnID<BackendRequest> for RequestKey {
 
 type Connector = PooledConnector<PgConnector, LruDropPool<PooledStream, PgConnId>, RequestKey>;
 
+/// When a leased backend is returned to the pool (pgbouncer-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolMode {
+    /// One backend per client connection, returned on disconnect.
+    Session,
+    /// A backend per transaction, returned at `ReadyForQuery` idle (the default).
+    #[default]
+    Transaction,
+    /// A backend per statement, returned after each `ReadyForQuery`; a backend
+    /// left mid-transaction is discarded (multi-statement transactions break).
+    Statement,
+}
+
 /// A transaction-pooling backend pool that round-robins transactions across one
 /// or more equivalent replica addresses.
 pub struct BackendPool {
     replicas: Vec<String>,
+    mode: PoolMode,
     next: AtomicUsize,
     /// `ParameterStatus` captured once (replicas are equivalent) and replayed to
     /// every client's synthesized startup.
@@ -147,8 +161,8 @@ pub struct BackendPool {
 
 impl BackendPool {
     /// Create a pool of up to `max_size` connections (total, across replicas),
-    /// round-robining transactions across `replicas`.
-    pub fn new(replicas: Vec<String>, max_size: usize) -> Arc<Self> {
+    /// round-robining transactions across `replicas`, with the given pool `mode`.
+    pub fn new(replicas: Vec<String>, max_size: usize, mode: PoolMode) -> Arc<Self> {
         assert!(!replicas.is_empty(), "backend pool needs at least one replica");
         let max = max_size.max(1);
         let pool = LruDropPool::try_new(max, max)
@@ -159,10 +173,16 @@ impl BackendPool {
             .with_drop_connection_if_no_response(false);
         Arc::new(Self {
             replicas,
+            mode,
             next: AtomicUsize::new(0),
             params: Mutex::new(None),
             connector: PooledConnector::new(PgConnector, pool, RequestKey),
         })
+    }
+
+    /// The pool mode (when a backend is returned).
+    pub fn mode(&self) -> PoolMode {
+        self.mode
     }
 
     /// The `ParameterStatus` frames to replay to a client during its synthesized
