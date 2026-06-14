@@ -166,7 +166,9 @@ where
         // Transaction-pooling mode: multiplex over a shared backend pool instead
         // of dialing a dedicated 1:1 connection.
         if let Some(pool) = self.pool.clone() {
-            return serve_pooled(stream, &startup_frame, outcome, pool).await;
+            let user = msg.user().unwrap_or_default().to_owned();
+            let database = msg.database().unwrap_or_default().to_owned();
+            return serve_pooled(stream, &startup_frame, &user, &database, outcome, pool).await;
         }
 
         let mut upstream = match TokioTcpStream::connect(&address).await {
@@ -257,6 +259,8 @@ where
 async fn serve_pooled<C>(
     mut stream: C,
     startup_frame: &[u8],
+    user: &str,
+    database: &str,
     outcome: ClientAuth,
     pool: Arc<BackendPool>,
 ) -> Result<(), BoxError>
@@ -274,12 +278,17 @@ where
 
     // Establish a backend once (capturing ParameterStatus), then release it —
     // the client is idle until it sends a query.
-    pool.checkout(startup_frame).await?.checkin();
+    let params = {
+        let lease = pool.lease(startup_frame, user, database).await?;
+        let params = lease.params();
+        lease.checkin();
+        params
+    };
 
     // Synthesize the startup completion to the client.
     stream.write_all(&authentication_ok()).await?;
-    for param in pool.params() {
-        stream.write_all(&param).await?;
+    for param in &params {
+        stream.write_all(param).await?;
     }
     stream
         .write_all(&backend_key_data(rand::random(), rand::random()))
@@ -297,14 +306,14 @@ where
             break;
         }
 
-        let mut backend = pool.checkout(startup_frame).await?;
-        backend.stream().write_all(first.as_bytes()).await?;
-        backend.stream().flush().await?;
+        let mut lease = pool.lease(startup_frame, user, database).await?;
+        lease.write_all(first.as_bytes()).await?;
+        lease.flush().await?;
 
-        match relay_transaction(&mut client, backend.stream()).await? {
-            TxnEnd::Complete => backend.checkin(),
+        match relay_transaction(&mut client, &mut lease).await? {
+            TxnEnd::Complete => lease.checkin(),
             TxnEnd::ClientGone => {
-                backend.discard();
+                lease.discard();
                 break;
             }
         }
@@ -324,12 +333,13 @@ enum TxnEnd {
 
 /// Relay one transaction between the client and a checked-out backend, watching
 /// the backend's `ReadyForQuery` to detect the transaction boundary.
-async fn relay_transaction<C>(
+async fn relay_transaction<C, B>(
     client: &mut codec::FramedReader<C>,
-    backend: &mut TokioTcpStream,
+    backend: &mut B,
 ) -> Result<TxnEnd, BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
 {
     let mut backend = codec::FramedReader::new(backend);
     loop {

@@ -1,94 +1,84 @@
-//! A pool of backend connections for transaction pooling.
+//! Backend connection pooling for transaction pooling, built on rama's generic
+//! client pool.
 //!
-//! Each pooled connection is established once — TCP connect, replay a captured
-//! `StartupMessage`, drive the (trust) backend startup to `ReadyForQuery` — and
-//! then reused across many client transactions. A connection is checked out for
-//! the duration of one transaction and returned at `ReadyForQuery` status `I`.
+//! The upstream side is expressed in rama's vocabulary: a [`PgConnector`]
+//! ([`rama::net::client::ConnectorService`]) establishes a fresh backend, and
+//! rama's [`PooledConnector`] + [`LruDropPool`] reuse connections keyed by a
+//! [`ReqToConnID`] (here `(user, database)`). A checked-out connection is a
+//! [`LeasedConnection`] that returns to the pool on `Drop` — which lines up with
+//! transaction-boundary semantics: hold the lease for one transaction, drop it
+//! at `ReadyForQuery` idle to return it, or [`Lease::discard`] a connection left
+//! mid-transaction.
 //!
-//! v1 scope: a single backend address, a trust backend (the pool can't satisfy
-//! a credential challenge), and one shared startup template — so all clients are
-//! assumed to use the same user/database. Per-(user,database) pools and
-//! non-trust backends are future work.
+//! v1 scope: a single backend address and a trust backend (the connector can't
+//! satisfy a credential challenge). The `(user, database)` key already gives
+//! separate pools per role/db; a shard key would extend it to sharding.
 
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::BytesMut;
+use rama::Service;
 use rama::error::BoxError;
-use rama::tcp::TokioTcpStream;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use rama::extensions::{Extension, Extensions, ExtensionsRef};
+use rama::net::client::EstablishedClientConnection;
+use rama::net::client::pool::{ConnID, LeasedConnection, LruDropPool, PooledConnector, ReqToConnID};
+use rama::tcp::{TcpStream, TokioTcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::protocol::codec::{self, read_message};
 
-/// A fixed-capacity pool of established backend connections to one address.
+/// The connection type the pool stores (rama's `TcpStream` carries the
+/// `Extensions` the pool and our captured params live in).
+type PooledStream = TcpStream;
+
+/// Pool keyed on `(user, database)`, so each role/database gets its own
+/// connections — the pgbouncer pooling unit.
+#[derive(Debug, Clone, PartialEq)]
+struct PgConnId {
+    user: String,
+    database: String,
+}
+
+impl ConnID for PgConnId {}
+
+/// `ParameterStatus` frames captured at backend startup, stashed on the
+/// connection's extensions and replayed to clients during their startup.
+#[derive(Debug, Clone)]
+struct CapturedParams(Vec<BytesMut>);
+
+impl Extension for CapturedParams {}
+
+/// The request flowing through the connector + pool: what to dial, the startup
+/// to replay, and the pool key.
 #[derive(Debug)]
-pub struct BackendPool {
-    address: String,
-    permits: Arc<Semaphore>,
-    inner: Mutex<PoolInner>,
+struct BackendRequest {
+    extensions: Extensions,
+    target: String,
+    startup: BytesMut,
+    id: PgConnId,
 }
 
-#[derive(Debug, Default)]
-struct PoolInner {
-    /// Idle, reusable connections (each at `ReadyForQuery` idle).
-    idle: Vec<TokioTcpStream>,
-    /// The `StartupMessage` frame used to bring up new connections.
-    startup_template: Option<BytesMut>,
-    /// `ParameterStatus` frames captured at startup, replayed to clients.
-    params: Option<Vec<BytesMut>>,
+impl ExtensionsRef for BackendRequest {
+    fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
 }
 
-impl BackendPool {
-    /// Create a pool of up to `max_size` connections to `address`.
-    pub fn new(address: impl Into<String>, max_size: usize) -> Arc<Self> {
-        Arc::new(Self {
-            address: address.into(),
-            permits: Arc::new(Semaphore::new(max_size.max(1))),
-            inner: Mutex::new(PoolInner::default()),
-        })
-    }
+/// Establishes a fresh backend: dial, replay the `StartupMessage`, drive the
+/// (trust) startup to `ReadyForQuery`, capturing `ParameterStatus`.
+#[derive(Debug, Clone)]
+struct PgConnector;
 
-    /// The captured `ParameterStatus` frames to replay to a client, available
-    /// once at least one backend has been established.
-    pub fn params(&self) -> Vec<BytesMut> {
-        self.inner.lock().unwrap().params.clone().unwrap_or_default()
-    }
+impl Service<BackendRequest> for PgConnector {
+    type Output = EstablishedClientConnection<PooledStream, BackendRequest>;
+    type Error = BoxError;
 
-    /// Check out a connection, establishing a new one (using `startup_frame` as
-    /// the template the first time) if none are idle. Blocks once `max_size`
-    /// connections are concurrently in use.
-    pub async fn checkout(
-        self: &Arc<Self>,
-        startup_frame: &[u8],
-    ) -> Result<PooledBackend, BoxError> {
-        let permit = self.permits.clone().acquire_owned().await?;
-
-        let idle = self.inner.lock().unwrap().idle.pop();
-        let conn = match idle {
-            Some(conn) => conn,
-            None => self.establish(startup_frame).await?,
-        };
-
-        Ok(PooledBackend {
-            pool: Arc::clone(self),
-            conn: Some(conn),
-            _permit: permit,
-        })
-    }
-
-    /// Establish a fresh backend connection and bring it to `ReadyForQuery`,
-    /// capturing `ParameterStatus` the first time.
-    async fn establish(&self, startup_frame: &[u8]) -> Result<TokioTcpStream, BoxError> {
-        let template = {
-            let mut inner = self.inner.lock().unwrap();
-            inner
-                .startup_template
-                .get_or_insert_with(|| BytesMut::from(startup_frame))
-                .clone()
-        };
-
-        let mut conn = TokioTcpStream::connect(&self.address).await?;
-        conn.write_all(&template).await?;
+    async fn serve(&self, req: BackendRequest) -> Result<Self::Output, Self::Error> {
+        let mut conn = TokioTcpStream::connect(&req.target).await?;
+        conn.write_all(&req.startup).await?;
         conn.flush().await?;
 
         let mut params = Vec::new();
@@ -117,45 +107,117 @@ impl BackendPool {
             }
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        if inner.params.is_none() {
-            inner.params = Some(params);
-        }
-        Ok(conn)
-    }
-
-    fn return_idle(&self, conn: TokioTcpStream) {
-        self.inner.lock().unwrap().idle.push(conn);
+        let conn = TcpStream::new(conn);
+        conn.extensions().insert(CapturedParams(params));
+        Ok(EstablishedClientConnection { input: req, conn })
     }
 }
 
-/// A connection checked out of a [`BackendPool`]. Returned to the pool on
-/// [`checkin`](Self::checkin); on drop without checkin it is discarded (a
-/// possibly-dirty connection is never reused). The capacity permit is released
-/// in all cases.
-pub struct PooledBackend {
-    pool: Arc<BackendPool>,
-    conn: Option<TokioTcpStream>,
-    _permit: OwnedSemaphorePermit,
+/// Maps a [`BackendRequest`] to its pool key.
+#[derive(Debug, Clone)]
+struct KeyByUserDatabase;
+
+impl ReqToConnID<BackendRequest> for KeyByUserDatabase {
+    type ID = PgConnId;
+
+    fn id(&self, req: &BackendRequest) -> Result<Self::ID, BoxError> {
+        Ok(req.id.clone())
+    }
 }
 
-impl PooledBackend {
-    /// The underlying stream, for relaying.
-    pub fn stream(&mut self) -> &mut TokioTcpStream {
-        self.conn.as_mut().expect("connection checked out")
+type Connector = PooledConnector<PgConnector, LruDropPool<PooledStream, PgConnId>, KeyByUserDatabase>;
+
+/// A transaction-pooling backend pool for a single address.
+pub struct BackendPool {
+    address: String,
+    connector: Connector,
+}
+
+impl BackendPool {
+    /// Create a pool of up to `max_size` connections to `address`.
+    pub fn new(address: impl Into<String>, max_size: usize) -> Arc<Self> {
+        let max = max_size.max(1);
+        let pool = LruDropPool::try_new(max, max)
+            .expect("valid pool size")
+            // We use the lease as a raw relay stream, not as a rama Service, so
+            // `got_response` is never set; without this the pool would discard
+            // every connection on return.
+            .with_drop_connection_if_no_response(false);
+        Arc::new(Self {
+            address: address.into(),
+            connector: PooledConnector::new(PgConnector, pool, KeyByUserDatabase),
+        })
     }
 
-    /// Return the connection to the pool for reuse (call at a transaction end,
-    /// `ReadyForQuery` status `I`).
-    pub fn checkin(mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.pool.return_idle(conn);
-        }
+    /// Lease a backend connection for one transaction, reusing an idle one for
+    /// the `(user, database)` key or establishing a new one (replaying
+    /// `startup_frame`). Blocks once the pool is at capacity.
+    pub async fn lease(
+        &self,
+        startup_frame: &[u8],
+        user: &str,
+        database: &str,
+    ) -> Result<Lease, BoxError> {
+        let req = BackendRequest {
+            extensions: Extensions::new(),
+            target: self.address.clone(),
+            startup: BytesMut::from(startup_frame),
+            id: PgConnId {
+                user: user.to_owned(),
+                database: database.to_owned(),
+            },
+        };
+        let established = self.connector.serve(req).await?;
+        Ok(Lease {
+            conn: established.conn,
+        })
+    }
+}
+
+/// A backend connection leased for one transaction. It is an opaque
+/// `AsyncRead`/`AsyncWrite` stream; [`checkin`](Self::checkin) returns it to the
+/// pool, [`discard`](Self::discard) drops it.
+pub struct Lease {
+    conn: LeasedConnection<PooledStream, PgConnId>,
+}
+
+impl Lease {
+    /// The backend's captured `ParameterStatus` frames, to replay to the client.
+    pub fn params(&self) -> Vec<BytesMut> {
+        self.conn
+            .extensions()
+            .get_ref::<CapturedParams>()
+            .map(|captured| captured.0.clone())
+            .unwrap_or_default()
     }
 
-    /// Discard the connection (e.g. the client left mid-transaction); it is not
-    /// returned to the pool.
-    pub fn discard(mut self) {
-        self.conn = None;
+    /// Return the connection to the pool (transaction completed, idle).
+    pub fn checkin(self) {
+        drop(self.conn); // LeasedConnection returns itself to the pool on drop.
+    }
+
+    /// Discard the connection (left mid-transaction); it is not pooled.
+    pub fn discard(self) {
+        let _ = self.conn.into_connection();
+    }
+}
+
+impl AsyncRead for Lease {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Lease {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().conn).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
     }
 }
