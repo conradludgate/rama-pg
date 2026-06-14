@@ -9,5 +9,6 @@ pub mod auth;
 pub mod pool;
 pub mod protocol;
 pub mod proxy;
+pub mod query;
 pub mod route;
 pub mod scram;

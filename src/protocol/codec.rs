@@ -23,6 +23,12 @@ pub const PARAMETER_STATUS: u8 = b'S';
 pub const READY_FOR_QUERY: u8 = b'Z';
 /// `ErrorResponse`.
 pub const ERROR_RESPONSE: u8 = b'E';
+/// `RowDescription` — column metadata preceding a result set.
+pub const ROW_DESCRIPTION: u8 = b'T';
+/// `DataRow` — one row of a result set.
+pub const DATA_ROW: u8 = b'D';
+/// `CommandComplete` — carries the command tag (e.g. `SELECT 1`).
+pub const COMMAND_COMPLETE: u8 = b'C';
 
 // Frontend → backend tags.
 /// `PasswordMessage` / SASL messages (cleartext password, JWT, SCRAM).

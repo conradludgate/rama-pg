@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use rama::error::BoxError;
@@ -15,6 +17,7 @@ use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
 use rama_pg::pool::BackendPool;
 use rama_pg::proxy::PgProxy;
+use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 use rama_pg::route::{Backend, Router};
 use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
 use tracing_subscriber::EnvFilter;
@@ -37,7 +40,8 @@ async fn main() -> Result<(), BoxError> {
 
     let auth = Arc::new(build_auth());
     let pool = build_pool();
-    let proxy = Arc::new(PgProxy::new(tls, router, auth, pool));
+    let handler = build_handler();
+    let proxy = Arc::new(PgProxy::new(tls, router, auth, pool, handler));
 
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");
@@ -48,6 +52,41 @@ async fn main() -> Result<(), BoxError> {
         .await;
 
     Ok(())
+}
+
+/// A demo in-proxy query handler: echoes the SQL, the connected user, and the
+/// current transaction status (read from the per-connection `SessionState`),
+/// proving the handler can both answer queries and observe transaction state.
+struct DemoHandler;
+
+impl QueryHandler for DemoHandler {
+    fn handle<'a>(
+        &'a self,
+        ctx: QueryContext<'a>,
+        sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = QueryResponse> + Send + 'a>> {
+        Box::pin(async move {
+            QueryResponse::Rows {
+                columns: vec!["echo".to_owned(), "user".to_owned(), "txn".to_owned()],
+                rows: vec![vec![
+                    Some(sql.to_owned()),
+                    Some(ctx.user.to_owned()),
+                    Some(format!("{:?}", ctx.state.txn_status())),
+                ]],
+                tag: "SELECT 1".to_owned(),
+            }
+        })
+    }
+}
+
+/// Enable the custom in-proxy query handler (no backend) with `RAMA_PG_CUSTOM`.
+fn build_handler() -> Option<Arc<dyn QueryHandler>> {
+    if env::var("RAMA_PG_CUSTOM").is_ok() {
+        tracing::info!("mode: custom in-proxy query handler (no backend)");
+        Some(Arc::new(DemoHandler) as Arc<dyn QueryHandler>)
+    } else {
+        None
+    }
 }
 
 /// Build the backend pool when transaction pooling is enabled:

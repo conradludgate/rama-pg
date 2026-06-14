@@ -50,6 +50,12 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
    `ParameterStatus`, and relays via a cancel-safe `FramedReader`. With several
    replica addresses, transactions are round-robined across them (read
    load-balancing — a multi-statement transaction stays pinned to one replica).
+8. **Custom in-proxy queries** (optional) — a "virtual Postgres" with no backend
+   at all: a pluggable async `QueryHandler` answers simple-protocol queries, the
+   proxy synthesizes the startup and encodes `RowDescription`/`DataRow`/
+   `CommandComplete`, and a per-connection mutable `SessionState` tracks the
+   transaction status (`I`/`T`/`E`) — visible to the handler — so `BEGIN`/
+   `COMMIT`/`ROLLBACK` work.
 
 ## Run
 
@@ -77,6 +83,10 @@ RAMA_PG_POOL_SIZE=8 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
 # pooling + replica sharding: round-robin transactions across two replicas
 RAMA_PG_POOL_SIZE=8 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
   RAMA_PG_REPLICAS="127.0.0.1:5434,127.0.0.1:5435" cargo run -p rama-pg-example
+
+# custom in-proxy queries: a virtual Postgres with no backend
+RAMA_PG_CUSTOM=1 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
+  cargo run -p rama-pg-example
 ```
 
 Connect through it (SNI comes from the host name; `hostaddr` keeps the dial on
@@ -99,6 +109,7 @@ psql "host=db.example.com hostaddr=127.0.0.1 port=6432 \
 | `RAMA_PG_SCRAM_SECRETS` | `user=SCRAM-SHA-256$…` verifiers, `;`-separated (scram) | —          |
 | `RAMA_PG_POOL_SIZE` | max pooled backend connections; enables transaction pooling | — (direct) |
 | `RAMA_PG_REPLICAS` | `host:port` replicas, `,`-separated, to round-robin across (pooling) | `RAMA_PG_BACKEND` |
+| `RAMA_PG_CUSTOM` | if set, answer queries in-proxy with no backend (virtual server) | — |
 
 TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 (which encrypts without verifying the certificate).
@@ -142,6 +153,8 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
 - `src/pool.rs` — transaction pooling + replica sharding on rama's client pool:
   a PG `Connector` through `PooledConnector` / `LruDropPool`, keyed on
   `(user, database, replica)`, round-robining transactions across replicas.
+- `src/query.rs` — the `QueryHandler` trait, `QueryResponse`, and the
+  per-connection mutable `SessionState` (transaction status) for custom mode.
 - `src/auth.rs` — the `Authenticator` trait, the `ClientAuth`/`BackendAuth`
   outcomes, the pass-through mechanism, and cleartext termination over a
   pluggable async `PasswordValidator`.
