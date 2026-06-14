@@ -6,7 +6,24 @@
 
 use bytes::{BufMut, BytesMut};
 
-use super::codec::{ERROR_RESPONSE, frame};
+use super::codec::{AUTHENTICATION, ERROR_RESPONSE, frame};
+
+/// `Authentication` sub-type: the request succeeded (`AuthenticationOk`).
+const AUTH_OK: i32 = 0;
+/// `Authentication` sub-type: the client must send a cleartext password.
+const AUTH_CLEARTEXT_PASSWORD: i32 = 3;
+
+/// Build an `AuthenticationOk` frame.
+pub fn authentication_ok() -> BytesMut {
+    frame(AUTHENTICATION, &AUTH_OK.to_be_bytes())
+}
+
+/// Build an `AuthenticationCleartextPassword` frame, asking the client to reply
+/// with a `PasswordMessage` carrying the password in the clear (safe here only
+/// because the client link is TLS).
+pub fn authentication_cleartext_password() -> BytesMut {
+    frame(AUTHENTICATION, &AUTH_CLEARTEXT_PASSWORD.to_be_bytes())
+}
 
 /// Build a fatal `ErrorResponse` frame.
 ///

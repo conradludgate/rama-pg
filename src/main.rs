@@ -1,5 +1,6 @@
 //! rama-pg proxy binary.
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use rama::error::BoxError;
 use rama::net::tls::server::SelfSignedData;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
-use rama_pg::auth::PassThrough;
+use rama_pg::auth::{Auth, CleartextPassword, PassThrough};
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
 use tracing_subscriber::EnvFilter;
@@ -28,7 +29,7 @@ async fn main() -> Result<(), BoxError> {
         tracing::warn!("no routes configured; set RAMA_PG_BACKEND and/or RAMA_PG_ROUTES");
     }
 
-    let auth = Arc::new(PassThrough);
+    let auth = Arc::new(build_auth());
 
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");
@@ -62,4 +63,29 @@ fn build_router() -> Router {
     }
 
     router
+}
+
+/// Select the authenticator from environment configuration:
+///
+/// - `RAMA_PG_AUTH` — `passthrough` (default) or `cleartext`.
+/// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (cleartext mode).
+fn build_auth() -> Auth {
+    if env::var("RAMA_PG_AUTH").as_deref() == Ok("cleartext") {
+        let mut credentials = HashMap::new();
+        if let Ok(users) = env::var("RAMA_PG_USERS") {
+            for entry in users.split(';').filter(|e| !e.is_empty()) {
+                match entry.split_once(':') {
+                    Some((user, password)) => {
+                        credentials.insert(user.trim().to_owned(), password.to_owned());
+                    }
+                    None => tracing::warn!(entry, "ignoring malformed RAMA_PG_USERS entry"),
+                }
+            }
+        }
+        tracing::info!(users = credentials.len(), "auth mode: cleartext (terminate)");
+        Auth::Cleartext(CleartextPassword::new(credentials))
+    } else {
+        tracing::info!("auth mode: pass-through");
+        Auth::PassThrough(PassThrough)
+    }
 }
