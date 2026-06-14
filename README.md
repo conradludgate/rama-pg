@@ -190,3 +190,7 @@ A Cargo workspace: the `rama-pg` library at the root, plus two example binaries.
   `PgProxy::with_forwarder`: a database-routing forwarder (admin console vs.
   pool), `pg_authid` SCRAM auth, pooling modes, and `SHOW` commands. Configured
   by a `pgbouncer.ini` (a small hand-rolled INI parser in `config.rs`).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
