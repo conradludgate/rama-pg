@@ -1,11 +1,21 @@
+[workspace]
+members = ["rama-pg-example"]
+
+[workspace.dependencies]
+rama = { git = "https://github.com/plabayo/rama", rev = "c0a7afb6249996274bb56b978c22c2e85b41b3ae", features = ["tcp", "rustls", "ring"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rama-pg = { path = "." }
+
 [package]
 name = "rama-pg"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rama = { git = "https://github.com/plabayo/rama", rev = "c0a7afb6249996274bb56b978c22c2e85b41b3ae", features = ["tcp", "rustls", "ring"] }
-tokio = { version = "1", features = ["full"] }
-bytes = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rama = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }

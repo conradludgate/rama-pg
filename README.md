@@ -33,13 +33,16 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
 
 ## Run
 
+`rama-pg` is a library; the runnable proxy is the `rama-pg-example` crate.
+
 ```sh
 # pass-through: the backend authenticates the client (works with SCRAM, md5, …)
-RAMA_PG_LISTEN=127.0.0.1:6432 RAMA_PG_BACKEND=127.0.0.1:5432 cargo run
+RAMA_PG_LISTEN=127.0.0.1:6432 RAMA_PG_BACKEND=127.0.0.1:5432 \
+  cargo run -p rama-pg-example
 
 # proxy-terminated cleartext auth in front of a trust backend
 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
-  RAMA_PG_BACKEND=127.0.0.1:5434 cargo run
+  RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
 ```
 
 Connect through it (SNI comes from the host name; `hostaddr` keeps the dial on
@@ -77,9 +80,13 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 
 ## Layout
 
+A Cargo workspace: the `rama-pg` library at the root, and a thin
+`rama-pg-example` binary crate that wires it up.
+
 - `src/protocol/` — wire types: `startup` (SSLRequest / StartupMessage /
   CancelRequest), `codec` (tagged frames + the `read_message` reader),
   `message` (server-message builders).
 - `src/route.rs` — the SNI router.
 - `src/auth.rs` — the `Authenticator` trait and mechanisms.
 - `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth → forward.
+- `rama-pg-example/` — the runnable proxy binary (env-driven configuration).

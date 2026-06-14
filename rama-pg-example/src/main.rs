@@ -1,4 +1,7 @@
-//! rama-pg proxy binary.
+//! Example binary wiring the `rama-pg` library into a runnable proxy.
+//!
+//! Configuration is environment-driven so the same binary can demonstrate both
+//! pass-through and terminating auth against different backends.
 
 use std::collections::HashMap;
 use std::env;

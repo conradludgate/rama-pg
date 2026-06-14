@@ -1519,6 +1519,16 @@ dependencies = [
  "rama",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rama-pg-example"
+version = "0.1.0"
+dependencies = [
+ "rama",
+ "rama-pg",
+ "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
