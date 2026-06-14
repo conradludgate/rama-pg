@@ -7,6 +7,7 @@ use rama::error::BoxError;
 use rama::net::tls::server::SelfSignedData;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
+use rama_pg::auth::PassThrough;
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
 use tracing_subscriber::EnvFilter;
@@ -27,12 +28,14 @@ async fn main() -> Result<(), BoxError> {
         tracing::warn!("no routes configured; set RAMA_PG_BACKEND and/or RAMA_PG_ROUTES");
     }
 
+    let auth = Arc::new(PassThrough);
+
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");
 
     TcpListener::bind(listen.as_str())
         .await?
-        .serve(PgProxy::new(tls, router))
+        .serve(PgProxy::new(tls, router, auth))
         .await;
 
     Ok(())

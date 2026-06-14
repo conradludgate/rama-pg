@@ -5,6 +5,7 @@
 //! TLS via rama's acceptor, parses the `StartupMessage`, and (incrementally)
 //! authenticates and forwards to a backend.
 
+pub mod auth;
 pub mod protocol;
 pub mod proxy;
 pub mod route;
