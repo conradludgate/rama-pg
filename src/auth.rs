@@ -2,14 +2,13 @@
 //!
 //! An [`Authenticator`] runs whatever client-side handshake a mechanism needs
 //! over the (TLS) client stream, then reports how the proxy should continue
-//! toward the backend:
+//! toward the backend via [`ClientAuth`]:
 //!
 //! - [`ClientAuth::PassThrough`] — the proxy did not interpret auth; it forwards
-//!   the client's `StartupMessage` and relays the auth exchange so the *backend*
-//!   authenticates the client.
-//! - [`ClientAuth::Terminated`] — the proxy authenticated the client itself; it
-//!   then establishes the backend connection and splices the backend's startup
-//!   result back to the client.
+//!   the `StartupMessage` and relays the exchange so the *backend* authenticates.
+//! - [`ClientAuth::Terminated`] — the proxy authenticated the client itself and
+//!   tells the proxy how to reach the backend ([`BackendAuth`]): a trust backend
+//!   (just relay its startup completion) or SCRAM reauth with recovered keys.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,14 +19,32 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
 use crate::protocol::startup::StartupMessage;
+use crate::scram::{ScramKeys, ScramSecretStore, ScramSha256, StaticSecretStore};
+
+/// Connection facts an [`Authenticator`] may key on: the parsed startup
+/// parameters and the TLS SNI.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthContext<'a> {
+    pub startup: &'a StartupMessage,
+    pub sni: Option<&'a str>,
+}
 
 /// How the proxy should reach the backend after client authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ClientAuth {
     /// Forward the StartupMessage and relay; the backend authenticates.
     PassThrough,
-    /// The proxy authenticated the client; it drives the backend itself.
-    Terminated,
+    /// The proxy authenticated the client; reach the backend this way.
+    Terminated(BackendAuth),
+}
+
+/// How the proxy authenticates to the backend in terminate mode.
+#[derive(Debug, Clone)]
+pub enum BackendAuth {
+    /// Backend needs no auth (trust): relay its startup completion.
+    Trust,
+    /// Reauthenticate to the backend via SCRAM, reusing the recovered keys.
+    Scram(ScramKeys),
 }
 
 /// A pluggable client-authentication mechanism.
@@ -37,7 +54,7 @@ pub trait Authenticator: Send + Sync + 'static {
     fn authenticate<IO>(
         &self,
         client: &mut IO,
-        startup: &StartupMessage,
+        ctx: &AuthContext<'_>,
     ) -> impl Future<Output = Result<ClientAuth, BoxError>> + Send
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send;
@@ -51,7 +68,7 @@ impl Authenticator for PassThrough {
     async fn authenticate<IO>(
         &self,
         _client: &mut IO,
-        _startup: &StartupMessage,
+        _ctx: &AuthContext<'_>,
     ) -> Result<ClientAuth, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send,
@@ -63,7 +80,7 @@ impl Authenticator for PassThrough {
 /// Cleartext-password termination: the proxy plays the auth server, asking the
 /// client for a cleartext password (safe only over TLS, which the proxy
 /// enforces) and checking it against a static credential map. On success the
-/// proxy connects to the backend itself ([`ClientAuth::Terminated`]).
+/// proxy connects to a trust backend ([`BackendAuth::Trust`]).
 #[derive(Debug, Clone, Default)]
 pub struct CleartextPassword {
     credentials: HashMap<String, String>,
@@ -79,7 +96,7 @@ impl Authenticator for CleartextPassword {
     async fn authenticate<IO>(
         &self,
         client: &mut IO,
-        startup: &StartupMessage,
+        ctx: &AuthContext<'_>,
     ) -> Result<ClientAuth, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send,
@@ -98,7 +115,7 @@ impl Authenticator for CleartextPassword {
             .into());
         }
 
-        let user = startup.user().unwrap_or_default();
+        let user = ctx.startup.user().unwrap_or_default();
         let supplied = password_bytes(msg.payload());
         let accepted = self
             .credentials
@@ -107,7 +124,7 @@ impl Authenticator for CleartextPassword {
 
         if accepted {
             tracing::info!(user, "client authenticated (cleartext, terminated)");
-            Ok(ClientAuth::Terminated)
+            Ok(ClientAuth::Terminated(BackendAuth::Trust))
         } else {
             tracing::warn!(user, "cleartext password authentication failed");
             client
@@ -130,27 +147,29 @@ fn password_bytes(payload: &[u8]) -> &[u8] {
     }
 }
 
-/// A runtime-selected authenticator, dispatching to a concrete mechanism.
+/// A runtime-selected authenticator, dispatching to a concrete mechanism. The
+/// SCRAM variant is generic over the secret store (defaulting to the in-memory
+/// [`StaticSecretStore`]).
 #[derive(Debug, Clone)]
-pub enum Auth {
+pub enum Auth<S = StaticSecretStore> {
     PassThrough(PassThrough),
     Cleartext(CleartextPassword),
-    Scram(crate::scram::ScramSha256),
+    Scram(ScramSha256<S>),
 }
 
-impl Authenticator for Auth {
+impl<S: ScramSecretStore> Authenticator for Auth<S> {
     async fn authenticate<IO>(
         &self,
         client: &mut IO,
-        startup: &StartupMessage,
+        ctx: &AuthContext<'_>,
     ) -> Result<ClientAuth, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
         match self {
-            Auth::PassThrough(a) => a.authenticate(client, startup).await,
-            Auth::Cleartext(a) => a.authenticate(client, startup).await,
-            Auth::Scram(a) => a.authenticate(client, startup).await,
+            Auth::PassThrough(a) => a.authenticate(client, ctx).await,
+            Auth::Cleartext(a) => a.authenticate(client, ctx).await,
+            Auth::Scram(a) => a.authenticate(client, ctx).await,
         }
     }
 }
@@ -198,11 +217,13 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(1024);
         let task = tokio::spawn(run_client(client, b"secret"));
 
-        let outcome = alice_creds()
-            .authenticate(&mut server, &startup_for("alice"))
-            .await
-            .unwrap();
-        assert_eq!(outcome, ClientAuth::Terminated);
+        let startup = startup_for("alice");
+        let ctx = AuthContext { startup: &startup, sni: None };
+        let outcome = alice_creds().authenticate(&mut server, &ctx).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ClientAuth::Terminated(BackendAuth::Trust)
+        ));
         drop(server); // EOF so the client's read_to_end returns
         task.await.unwrap();
     }
@@ -212,9 +233,9 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(1024);
         let task = tokio::spawn(run_client(client, b"wrong"));
 
-        let result = alice_creds()
-            .authenticate(&mut server, &startup_for("alice"))
-            .await;
+        let startup = startup_for("alice");
+        let ctx = AuthContext { startup: &startup, sni: None };
+        let result = alice_creds().authenticate(&mut server, &ctx).await;
         assert!(result.is_err());
         drop(server); // EOF after the ErrorResponse
 

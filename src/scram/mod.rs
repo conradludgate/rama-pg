@@ -1,25 +1,26 @@
-//! SCRAM-SHA-256 termination (RFC 5802 / RFC 7677).
+//! SCRAM-SHA-256 termination with upstream reauthentication (RFC 5802 / 7677).
 //!
-//! The proxy plays the SASL *server*: it offers `SCRAM-SHA-256`, runs the
-//! four-message challenge/response against a static credential map, and on
-//! success connects to the backend itself ([`ClientAuth::Terminated`]). The
-//! backend's `AuthenticationOk` is then relayed to the client by the proxy's
-//! startup splice, so this only supports a trust/already-satisfied backend for
-//! now (proxy-to-backend reauth with the derived keys is future work).
+//! The proxy plays the SASL *server* to the client: it offers `SCRAM-SHA-256`
+//! and runs the four-message exchange, but using the verifier fetched from a
+//! pluggable [`ScramSecretStore`] (keyed on user/database/SNI) rather than a
+//! plaintext password. Because it presents Postgres' own salt and iteration
+//! count, the `ClientKey` it *recovers* from the client's proof is valid against
+//! the backend too — so the proxy carries that key material out as
+//! [`BackendAuth::Scram`] and (in [`client`]) reauthenticates to the backend as
+//! a SCRAM client, never holding the plaintext.
 //!
 //! Channel binding (`SCRAM-SHA-256-PLUS`) is not offered, so the client's GS2
-//! header must be `n,,` or `y,,`.
-//!
-//! Known simplifications: passwords are not SASLprep-normalised (fine for
-//! ASCII), and unknown users are rejected without mock-authentication timing.
+//! header must be `n,,` or `y,,`. Passwords are not SASLprep-normalised (fine
+//! for ASCII); unknown users get a random mock verifier so the handshake shape
+//! is identical to a known user before failing.
 
+mod client;
 mod crypto;
 mod secret;
 
+pub use client::reauth_upstream;
 pub use crypto::ScramKeys;
 pub use secret::{ScramSecret, ScramSecretStore, SecretLookup, StaticSecretStore};
-
-use std::collections::HashMap;
 
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
@@ -27,42 +28,48 @@ use rama::error::BoxError;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{Authenticator, ClientAuth};
+use crate::auth::{AuthContext, Authenticator, BackendAuth, ClientAuth};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
-use crate::protocol::startup::StartupMessage;
 
 const MECHANISM: &str = "SCRAM-SHA-256";
 const DEFAULT_ITERATIONS: u32 = 4096;
-const NONCE_BYTES: usize = 18;
-const SALT_BYTES: usize = 16;
 
-/// SCRAM-SHA-256 authenticator backed by a static `user -> password` map.
-#[derive(Debug, Clone, Default)]
-pub struct ScramSha256 {
-    credentials: HashMap<String, String>,
-    iterations: u32,
+/// SCRAM-SHA-256 authenticator backed by a pluggable [`ScramSecretStore`].
+#[derive(Debug, Clone)]
+pub struct ScramSha256<S> {
+    store: S,
 }
 
-impl ScramSha256 {
-    pub fn new(credentials: HashMap<String, String>) -> Self {
-        Self {
-            credentials,
-            iterations: DEFAULT_ITERATIONS,
-        }
+impl<S: ScramSecretStore> ScramSha256<S> {
+    pub fn new(store: S) -> Self {
+        Self { store }
     }
 }
 
-impl Authenticator for ScramSha256 {
+impl<S: ScramSecretStore> Authenticator for ScramSha256<S> {
     async fn authenticate<IO>(
         &self,
         client: &mut IO,
-        startup: &StartupMessage,
+        ctx: &AuthContext<'_>,
     ) -> Result<ClientAuth, BoxError>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let user = startup.user().unwrap_or_default();
+        let user = ctx.startup.user().unwrap_or_default();
+
+        // Resolve the verifier up front. An unknown user gets a random mock so
+        // the exchange looks identical until the proof fails.
+        let secret = self
+            .store
+            .get_secret(SecretLookup {
+                user,
+                database: ctx.startup.database(),
+                sni: ctx.sni,
+            })
+            .await?;
+        let known = secret.is_some();
+        let secret = secret.unwrap_or_else(mock_secret);
 
         // 1. Offer SCRAM-SHA-256.
         client
@@ -83,14 +90,14 @@ impl Authenticator for ScramSha256 {
         }
         let client_first = parse_client_first(&client_first)?;
 
-        // 3. server-first-message with the combined nonce, salt, iteration count.
-        let server_nonce = random_nonce();
+        // 3. server-first-message: present the *verifier's* salt and iteration
+        // count, so the client's ClientKey matches the backend's.
+        let server_nonce = crypto::random_nonce();
         let full_nonce = format!("{}{server_nonce}", client_first.client_nonce);
-        let salt = random_salt();
         let server_first = format!(
             "r={full_nonce},s={},i={}",
-            BASE64_STANDARD.encode(salt),
-            self.iterations,
+            BASE64_STANDARD.encode(&secret.salt),
+            secret.iterations,
         );
         client
             .write_all(&message::authentication_sasl_continue(server_first.as_bytes()))
@@ -113,30 +120,24 @@ impl Authenticator for ScramSha256 {
             return self.deny(client, "scram: channel binding mismatch").await;
         }
 
-        // 5. Verify the client proof against the stored password.
-        let Some(password) = self.credentials.get(user) else {
-            return self.deny(client, "scram: unknown user").await;
-        };
-        let keys = ScramKeys::from_password(password.as_bytes(), &salt, self.iterations);
-
+        // 5. Verify the client proof and recover the ClientKey.
         let auth_message = format!(
             "{},{server_first},{}",
             client_first.bare, client_final.without_proof
         );
-        let client_signature = crypto::hmac_sha256(&keys.stored_key, auth_message.as_bytes());
+        let client_signature = crypto::hmac_sha256(&secret.stored_key, auth_message.as_bytes());
 
         let proof = BASE64_STANDARD.decode(&client_final.proof)?;
         let Ok(proof) = <[u8; 32]>::try_from(proof) else {
             return self.deny(client, "scram: malformed client proof").await;
         };
-        let recovered = crypto::recover_client_key(&proof, &client_signature);
-        if !bool::from(crypto::sha256(&recovered).ct_eq(&keys.stored_key)) {
+        let client_key = crypto::recover_client_key(&proof, &client_signature);
+        if !known || !bool::from(crypto::sha256(&client_key).ct_eq(&secret.stored_key)) {
             return self.deny(client, "scram: client proof verification failed").await;
         }
 
-        // 6. AuthenticationSASLFinal with the server signature, proving we hold
-        // the same key material to the client.
-        let server_signature = crypto::hmac_sha256(&keys.server_key, auth_message.as_bytes());
+        // 6. AuthenticationSASLFinal with the server signature.
+        let server_signature = crypto::hmac_sha256(&secret.server_key, auth_message.as_bytes());
         let final_message = format!("v={}", BASE64_STANDARD.encode(server_signature));
         client
             .write_all(&message::authentication_sasl_final(final_message.as_bytes()))
@@ -144,11 +145,16 @@ impl Authenticator for ScramSha256 {
         client.flush().await?;
 
         tracing::info!(user, "client authenticated (scram-sha-256, terminated)");
-        Ok(ClientAuth::Terminated)
+        // Hand the recovered keys to the proxy so it can reauthenticate upstream.
+        Ok(ClientAuth::Terminated(BackendAuth::Scram(ScramKeys {
+            client_key,
+            stored_key: secret.stored_key,
+            server_key: secret.server_key,
+        })))
     }
 }
 
-impl ScramSha256 {
+impl<S: ScramSecretStore> ScramSha256<S> {
     /// Send a generic auth failure to the client and return an error. The detail
     /// is logged but masked from the client as `28P01`, matching Postgres.
     async fn deny<IO>(&self, client: &mut IO, detail: &str) -> Result<ClientAuth, BoxError>
@@ -164,6 +170,23 @@ impl ScramSha256 {
             .await?;
         client.flush().await?;
         Err(detail.to_owned().into())
+    }
+}
+
+/// A random verifier for an unknown user, so the handshake is indistinguishable
+/// from a known one until the proof inevitably fails.
+fn mock_secret() -> ScramSecret {
+    let mut salt = [0u8; 16];
+    let mut stored_key = [0u8; 32];
+    let mut server_key = [0u8; 32];
+    rand::fill(&mut salt[..]);
+    rand::fill(&mut stored_key[..]);
+    rand::fill(&mut server_key[..]);
+    ScramSecret {
+        iterations: DEFAULT_ITERATIONS,
+        salt: salt.to_vec(),
+        stored_key,
+        server_key,
     }
 }
 
@@ -251,19 +274,6 @@ fn parse_client_final(s: &str) -> Result<ClientFinal, BoxError> {
         proof,
         without_proof,
     })
-}
-
-fn random_salt() -> [u8; SALT_BYTES] {
-    let mut salt = [0u8; SALT_BYTES];
-    rand::fill(&mut salt[..]);
-    salt
-}
-
-/// A printable, comma-free nonce (base64 has neither comma nor whitespace).
-fn random_nonce() -> String {
-    let mut bytes = [0u8; NONCE_BYTES];
-    rand::fill(&mut bytes[..]);
-    BASE64_STANDARD.encode(bytes)
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use rama::tcp::{TcpStream, TokioTcpStream};
 use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
-use crate::auth::{Authenticator, ClientAuth};
+use crate::auth::{AuthContext, Authenticator, BackendAuth, ClientAuth};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message::fatal_error;
 use crate::protocol::startup::{StartupRequest, read_startup_frame, read_startup_request};
@@ -149,7 +149,11 @@ where
         );
 
         // Authenticate the client; the outcome decides how we reach the backend.
-        let outcome = self.auth.authenticate(&mut stream, &msg).await?;
+        let auth_ctx = AuthContext {
+            startup: &msg,
+            sni: sni.as_deref(),
+        };
+        let outcome = self.auth.authenticate(&mut stream, &auth_ctx).await?;
 
         let mut upstream = match TokioTcpStream::connect(&address).await {
             Ok(stream) => stream,
@@ -162,11 +166,18 @@ where
         upstream.write_all(&startup_frame).await?;
         upstream.flush().await?;
 
-        // In terminate mode we authenticated the client ourselves, so splice the
-        // backend's startup result (AuthenticationOk, ParameterStatus, …,
-        // ReadyForQuery) to the client before relaying the query phase.
-        if outcome == ClientAuth::Terminated {
-            relay_backend_startup(&mut stream, &mut upstream).await?;
+        // In terminate mode we authenticated the client ourselves, so satisfy
+        // the backend's auth and splice its startup result (AuthenticationOk,
+        // ParameterStatus, …, ReadyForQuery) to the client before relaying.
+        match outcome {
+            ClientAuth::PassThrough => {}
+            ClientAuth::Terminated(BackendAuth::Trust) => {
+                relay_backend_startup(&mut stream, &mut upstream).await?;
+            }
+            ClientAuth::Terminated(BackendAuth::Scram(keys)) => {
+                crate::scram::reauth_upstream(&mut upstream, &keys).await?;
+                relay_backend_startup(&mut stream, &mut upstream).await?;
+            }
         }
 
         let (client_to_backend, backend_to_client) =

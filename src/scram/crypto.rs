@@ -4,7 +4,17 @@
 //! separate `hmac`/`pbkdf2` release against the bleeding-edge `sha2`. Correctness
 //! is pinned by the RFC 7677 / RFC 4231 test vectors below.
 
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
 use sha2::{Digest, Sha256};
+
+/// A printable, comma-free SCRAM nonce (base64 has neither comma nor
+/// whitespace), drawn from the thread CSPRNG.
+pub fn random_nonce() -> String {
+    let mut bytes = [0u8; 18];
+    rand::fill(&mut bytes[..]);
+    BASE64_STANDARD.encode(bytes)
+}
 
 /// The key material derived from a SCRAM password (or recovered during a
 /// handshake). `client_key` is the piece a SCRAM *client* needs to produce a
@@ -45,8 +55,6 @@ pub fn recover_client_key(proof: &[u8; 32], client_signature: &[u8; 32]) -> [u8;
 }
 
 /// `ClientProof = ClientKey XOR ClientSignature`.
-// Used by the upstream SCRAM client (reauth) and the crypto tests.
-#[allow(dead_code)]
 pub fn client_proof(client_key: &[u8; 32], client_signature: &[u8; 32]) -> [u8; 32] {
     let mut proof = [0u8; 32];
     for i in 0..32 {
@@ -109,8 +117,6 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::prelude::BASE64_STANDARD;
 
     // RFC 7677 §3 worked example for SCRAM-SHA-256.
     const PASSWORD: &str = "pencil";

@@ -15,7 +15,7 @@ use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough};
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
-use rama_pg::scram::ScramSha256;
+use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -74,7 +74,9 @@ fn build_router() -> Router {
 /// Select the authenticator from environment configuration:
 ///
 /// - `RAMA_PG_AUTH` — `passthrough` (default), `cleartext`, or `scram`.
-/// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (terminate modes).
+/// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (cleartext mode).
+/// - `RAMA_PG_SCRAM_SECRETS` — `user=SCRAM-SHA-256$...` verifiers separated by
+///   `;` (scram mode; copy from Postgres `pg_authid.rolpassword`).
 fn build_auth() -> Auth {
     match env::var("RAMA_PG_AUTH").as_deref() {
         Ok("cleartext") => {
@@ -83,9 +85,9 @@ fn build_auth() -> Auth {
             Auth::Cleartext(CleartextPassword::new(credentials))
         }
         Ok("scram") => {
-            let credentials = parse_users();
-            tracing::info!(users = credentials.len(), "auth mode: scram-sha-256 (terminate)");
-            Auth::Scram(ScramSha256::new(credentials))
+            let store = build_scram_store();
+            tracing::info!("auth mode: scram-sha-256 (terminate + upstream reauth)");
+            Auth::Scram(ScramSha256::new(store))
         }
         _ => {
             tracing::info!("auth mode: pass-through");
@@ -108,4 +110,24 @@ fn parse_users() -> HashMap<String, String> {
         }
     }
     credentials
+}
+
+/// Build the SCRAM verifier store from `RAMA_PG_SCRAM_SECRETS`.
+fn build_scram_store() -> StaticSecretStore {
+    let mut store = StaticSecretStore::new();
+    if let Ok(secrets) = env::var("RAMA_PG_SCRAM_SECRETS") {
+        for entry in secrets.split(';').filter(|e| !e.is_empty()) {
+            match entry.split_once('=') {
+                Some((user, verifier)) => match ScramSecret::parse(verifier.trim()) {
+                    Ok(secret) => store = store.with_secret(user.trim(), secret),
+                    Err(err) => tracing::warn!(user, %err, "ignoring invalid SCRAM verifier"),
+                },
+                None => tracing::warn!(entry, "ignoring malformed RAMA_PG_SCRAM_SECRETS entry"),
+            }
+        }
+    }
+    if store.is_empty() {
+        tracing::warn!("scram mode but no verifiers; set RAMA_PG_SCRAM_SECRETS");
+    }
+    store
 }
