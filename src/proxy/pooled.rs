@@ -6,11 +6,10 @@ use rama::Service;
 use rama::error::BoxError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
-use super::{PgClient, reject};
+use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
 use crate::pool::{BackendPool, PoolMode};
 use crate::protocol::codec;
-use crate::protocol::message::{authentication_ok, backend_key_data, ready_for_query};
 
 /// Transaction-pooling forwarding (with round-robin replica sharding).
 pub struct PooledForwarder {
@@ -69,17 +68,7 @@ where
     // The client is idle until it sends a query, so we don't hold a backend yet;
     // the pool gives us the (cached) ParameterStatus to replay.
     let params = pool.startup_params(startup_frame, user, database).await?;
-
-    // Synthesize the startup completion to the client.
-    stream.write_all(&authentication_ok()).await?;
-    for param in &params {
-        stream.write_all(param).await?;
-    }
-    stream
-        .write_all(&backend_key_data(rand::random(), rand::random()))
-        .await?;
-    stream.write_all(&ready_for_query(b'I')).await?;
-    stream.flush().await?;
+    synthesize_startup(&mut stream, &params).await?;
 
     match pool.mode() {
         // One backend for the whole connection — relay opaquely until disconnect.

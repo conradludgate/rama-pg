@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use rama::Service;
 use rama::error::BoxError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use super::{PgClient, reject};
+use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message::{
-    authentication_ok, backend_key_data, command_complete, data_row, error_response,
-    parameter_status, ready_for_query, row_description,
+    command_complete, data_row, error_response, parameter_status, ready_for_query, row_description,
 };
 use crate::query::{QueryContext, QueryHandler, QueryResponse, SessionState, TxnStatus};
 
@@ -73,17 +73,11 @@ where
     }
 
     // Synthesize the startup completion (there is no backend to capture from).
-    stream.write_all(&authentication_ok()).await?;
-    for (name, value) in VIRTUAL_PARAMETERS {
-        stream.write_all(&parameter_status(name, value)).await?;
-    }
-    stream
-        .write_all(&backend_key_data(rand::random(), rand::random()))
-        .await?;
-    stream
-        .write_all(&ready_for_query(TxnStatus::Idle.code()))
-        .await?;
-    stream.flush().await?;
+    let params: Vec<BytesMut> = VIRTUAL_PARAMETERS
+        .iter()
+        .map(|(name, value)| parameter_status(name, value))
+        .collect();
+    synthesize_startup(&mut stream, &params).await?;
 
     let state = SessionState::default();
     loop {

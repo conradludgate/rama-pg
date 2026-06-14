@@ -35,7 +35,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::auth::{AuthContext, Authenticator, ClientAuth};
 use crate::pool::BackendPool;
-use crate::protocol::message::fatal_error;
+use crate::protocol::message::{authentication_ok, backend_key_data, fatal_error, ready_for_query};
 use crate::protocol::startup::{
     StartupMessage, StartupRequest, read_startup_frame, read_startup_request,
 };
@@ -224,6 +224,26 @@ where
 {
     let err = fatal_error(code, message);
     stream.write_all(&err).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Synthesize the startup completion the proxy sends a client when it terminated
+/// auth itself: `AuthenticationOk`, the given `ParameterStatus` frames, a
+/// proxy-issued `BackendKeyData`, and an idle `ReadyForQuery`. Used by the
+/// pooled and custom leaves (which have no per-client backend to relay from).
+async fn synthesize_startup<IO>(stream: &mut IO, params: &[BytesMut]) -> Result<(), BoxError>
+where
+    IO: AsyncWrite + Unpin,
+{
+    stream.write_all(&authentication_ok()).await?;
+    for param in params {
+        stream.write_all(param).await?;
+    }
+    stream
+        .write_all(&backend_key_data(rand::random(), rand::random()))
+        .await?;
+    stream.write_all(&ready_for_query(b'I')).await?;
     stream.flush().await?;
     Ok(())
 }
