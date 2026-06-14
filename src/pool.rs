@@ -10,13 +10,19 @@
 //! at `ReadyForQuery` idle to return it, or [`Lease::discard`] a connection left
 //! mid-transaction.
 //!
-//! v1 scope: a single backend address and a trust backend (the connector can't
-//! satisfy a credential challenge). The `(user, database)` key already gives
-//! separate pools per role/db; a shard key would extend it to sharding.
+//! Replica sharding: the pool round-robins each transaction across a list of
+//! equivalent replica addresses (read load-balancing — no primary/replica split,
+//! no key-based sharding, since replicas hold the same data). The chosen replica
+//! joins the `(user, database)` pool key, so each replica keeps its own
+//! connections.
+//!
+//! v1 scope: trust backends only (the connector can't satisfy a credential
+//! challenge). A single address is just a one-element replica list.
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
@@ -34,12 +40,13 @@ use crate::protocol::codec::{self, read_message};
 /// `Extensions` the pool and our captured params live in).
 type PooledStream = TcpStream;
 
-/// Pool keyed on `(user, database)`, so each role/database gets its own
-/// connections — the pgbouncer pooling unit.
+/// Pool key: `(user, database)` — the pgbouncer pooling unit — plus the chosen
+/// replica `shard`, so a connection is only reused for the same replica.
 #[derive(Debug, Clone, PartialEq)]
 struct PgConnId {
     user: String,
     database: String,
+    shard: String,
 }
 
 impl ConnID for PgConnId {}
@@ -113,11 +120,11 @@ impl Service<BackendRequest> for PgConnector {
     }
 }
 
-/// Maps a [`BackendRequest`] to its pool key.
+/// Maps a [`BackendRequest`] to its pool key (composed in [`BackendPool::lease`]).
 #[derive(Debug, Clone)]
-struct KeyByUserDatabase;
+struct RequestKey;
 
-impl ReqToConnID<BackendRequest> for KeyByUserDatabase {
+impl ReqToConnID<BackendRequest> for RequestKey {
     type ID = PgConnId;
 
     fn id(&self, req: &BackendRequest) -> Result<Self::ID, BoxError> {
@@ -125,17 +132,24 @@ impl ReqToConnID<BackendRequest> for KeyByUserDatabase {
     }
 }
 
-type Connector = PooledConnector<PgConnector, LruDropPool<PooledStream, PgConnId>, KeyByUserDatabase>;
+type Connector = PooledConnector<PgConnector, LruDropPool<PooledStream, PgConnId>, RequestKey>;
 
-/// A transaction-pooling backend pool for a single address.
+/// A transaction-pooling backend pool that round-robins transactions across one
+/// or more equivalent replica addresses.
 pub struct BackendPool {
-    address: String,
+    replicas: Vec<String>,
+    next: AtomicUsize,
+    /// `ParameterStatus` captured once (replicas are equivalent) and replayed to
+    /// every client's synthesized startup.
+    params: Mutex<Option<Vec<BytesMut>>>,
     connector: Connector,
 }
 
 impl BackendPool {
-    /// Create a pool of up to `max_size` connections to `address`.
-    pub fn new(address: impl Into<String>, max_size: usize) -> Arc<Self> {
+    /// Create a pool of up to `max_size` connections (total, across replicas),
+    /// round-robining transactions across `replicas`.
+    pub fn new(replicas: Vec<String>, max_size: usize) -> Arc<Self> {
+        assert!(!replicas.is_empty(), "backend pool needs at least one replica");
         let max = max_size.max(1);
         let pool = LruDropPool::try_new(max, max)
             .expect("valid pool size")
@@ -144,27 +158,56 @@ impl BackendPool {
             // every connection on return.
             .with_drop_connection_if_no_response(false);
         Arc::new(Self {
-            address: address.into(),
-            connector: PooledConnector::new(PgConnector, pool, KeyByUserDatabase),
+            replicas,
+            next: AtomicUsize::new(0),
+            params: Mutex::new(None),
+            connector: PooledConnector::new(PgConnector, pool, RequestKey),
         })
     }
 
-    /// Lease a backend connection for one transaction, reusing an idle one for
-    /// the `(user, database)` key or establishing a new one (replaying
-    /// `startup_frame`). Blocks once the pool is at capacity.
+    /// The `ParameterStatus` frames to replay to a client during its synthesized
+    /// startup. Captured once from a backend and cached, so it doesn't perturb
+    /// the per-transaction round-robin after the first client.
+    pub async fn startup_params(
+        &self,
+        startup_frame: &[u8],
+        user: &str,
+        database: &str,
+    ) -> Result<Vec<BytesMut>, BoxError> {
+        if let Some(params) = self.params.lock().unwrap().clone() {
+            return Ok(params);
+        }
+        let lease = self.lease(startup_frame, user, database).await?;
+        let params = lease.params();
+        lease.checkin();
+        *self.params.lock().unwrap() = Some(params.clone());
+        Ok(params)
+    }
+
+    /// Pick the next replica, round-robin.
+    fn next_replica(&self) -> String {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.replicas.len();
+        self.replicas[index].clone()
+    }
+
+    /// Lease a backend connection for one transaction: pick a replica, then
+    /// reuse an idle connection for the `(user, database, replica)` key or
+    /// establish a new one (replaying `startup_frame`). Blocks at capacity.
     pub async fn lease(
         &self,
         startup_frame: &[u8],
         user: &str,
         database: &str,
     ) -> Result<Lease, BoxError> {
+        let shard = self.next_replica();
         let req = BackendRequest {
             extensions: Extensions::new(),
-            target: self.address.clone(),
+            target: shard.clone(),
             startup: BytesMut::from(startup_frame),
             id: PgConnId {
                 user: user.to_owned(),
                 database: database.to_owned(),
+                shard,
             },
         };
         let established = self.connector.serve(req).await?;

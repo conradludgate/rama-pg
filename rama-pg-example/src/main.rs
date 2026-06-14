@@ -52,20 +52,25 @@ async fn main() -> Result<(), BoxError> {
 
 /// Build the backend pool when transaction pooling is enabled:
 ///
-/// - `RAMA_PG_POOL_SIZE` — max backend connections; enables pooling when set.
-///
-/// The pool targets `RAMA_PG_BACKEND` (single backend, no sharding in v1).
+/// - `RAMA_PG_POOL_SIZE` — max backend connections (total); enables pooling.
+/// - `RAMA_PG_REPLICAS` — `host:port` replicas separated by `,` to round-robin
+///   across (falls back to `RAMA_PG_BACKEND` as a single replica).
 fn build_pool() -> Option<Arc<BackendPool>> {
     let size: usize = env::var("RAMA_PG_POOL_SIZE").ok()?.parse().ok()?;
-    let address = match env::var("RAMA_PG_BACKEND") {
-        Ok(address) => address,
-        Err(_) => {
-            tracing::warn!("RAMA_PG_POOL_SIZE set but RAMA_PG_BACKEND missing; pooling disabled");
-            return None;
-        }
+    let replicas: Vec<String> = match env::var("RAMA_PG_REPLICAS") {
+        Ok(list) => list
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => env::var("RAMA_PG_BACKEND").ok().into_iter().collect(),
     };
-    tracing::info!(size, %address, "transaction pooling enabled");
-    Some(BackendPool::new(address, size))
+    if replicas.is_empty() {
+        tracing::warn!("RAMA_PG_POOL_SIZE set but no RAMA_PG_REPLICAS/RAMA_PG_BACKEND; pooling disabled");
+        return None;
+    }
+    tracing::info!(size, ?replicas, "transaction pooling enabled");
+    Some(BackendPool::new(replicas, size))
 }
 
 /// Build the SNI router from environment configuration:

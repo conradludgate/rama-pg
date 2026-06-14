@@ -137,6 +137,23 @@ where
             }
         };
 
+        // Authenticate the client; the outcome decides how we reach the backend.
+        let auth_ctx = AuthContext {
+            startup: &msg,
+            sni: sni.as_deref(),
+        };
+        let outcome = self.auth.authenticate(&mut stream, &auth_ctx).await?;
+
+        // Transaction-pooling mode bypasses SNI→backend routing: the pool's
+        // replicas are the destination.
+        if let Some(pool) = self.pool.clone() {
+            let user = msg.user().unwrap_or_default().to_owned();
+            let database = msg.database().unwrap_or_default().to_owned();
+            tracing::info!(?sni, user, database, "pooled connection");
+            return serve_pooled(stream, &startup_frame, &user, &database, outcome, pool).await;
+        }
+
+        // Direct 1:1 mode: resolve the backend from the SNI.
         let Some(backend) = self.router.route(sni.as_deref()) else {
             tracing::info!(?sni, user = ?msg.user(), "no backend route for SNI");
             return reject(
@@ -147,7 +164,6 @@ where
             .await;
         };
         let address = backend.address.clone();
-
         tracing::info!(
             ?sni,
             user = ?msg.user(),
@@ -155,21 +171,6 @@ where
             backend = %address,
             "routing connection",
         );
-
-        // Authenticate the client; the outcome decides how we reach the backend.
-        let auth_ctx = AuthContext {
-            startup: &msg,
-            sni: sni.as_deref(),
-        };
-        let outcome = self.auth.authenticate(&mut stream, &auth_ctx).await?;
-
-        // Transaction-pooling mode: multiplex over a shared backend pool instead
-        // of dialing a dedicated 1:1 connection.
-        if let Some(pool) = self.pool.clone() {
-            let user = msg.user().unwrap_or_default().to_owned();
-            let database = msg.database().unwrap_or_default().to_owned();
-            return serve_pooled(stream, &startup_frame, &user, &database, outcome, pool).await;
-        }
 
         let mut upstream = match TokioTcpStream::connect(&address).await {
             Ok(stream) => stream,
@@ -276,14 +277,9 @@ where
         .await;
     }
 
-    // Establish a backend once (capturing ParameterStatus), then release it —
-    // the client is idle until it sends a query.
-    let params = {
-        let lease = pool.lease(startup_frame, user, database).await?;
-        let params = lease.params();
-        lease.checkin();
-        params
-    };
+    // The client is idle until it sends a query, so we don't hold a backend yet;
+    // the pool gives us the (cached) ParameterStatus to replay.
+    let params = pool.startup_params(startup_frame, user, database).await?;
 
     // Synthesize the startup completion to the client.
     stream.write_all(&authentication_ok()).await?;

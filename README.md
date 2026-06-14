@@ -40,14 +40,16 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
      (`-PLUS`) is not offered.
 6. **Direct 1:1 proxy** — forward the `StartupMessage` verbatim, then
    `tokio::io::copy_bidirectional`.
-7. **Transaction pooling** (optional) — multiplex clients over a shared pool of
-   backend connections, built on **rama's own client pool** (`PooledConnector` +
-   `LruDropPool` + a `ReqToConnID` keyed on `(user, database)`). A connection is
-   leased per transaction and returned at `ReadyForQuery` status `I` by dropping
-   the `LeasedConnection` (a backend left mid-transaction is discarded, so no
-   state leaks). The proxy terminates auth, synthesizes the client's startup from
-   the pool's captured `ParameterStatus`, and relays via a cancel-safe
-   `FramedReader`. Single backend address; no sharding yet.
+7. **Transaction pooling + replica sharding** (optional) — multiplex clients over
+   a shared pool of backend connections, built on **rama's own client pool**
+   (`PooledConnector` + `LruDropPool` + a `ReqToConnID` keyed on
+   `(user, database, replica)`). A connection is leased per transaction and
+   returned at `ReadyForQuery` status `I` by dropping the `LeasedConnection` (a
+   backend left mid-transaction is discarded, so no state leaks). The proxy
+   terminates auth, synthesizes the client's startup from the pool's captured
+   `ParameterStatus`, and relays via a cancel-safe `FramedReader`. With several
+   replica addresses, transactions are round-robined across them (read
+   load-balancing — a multi-statement transaction stays pinned to one replica).
 
 ## Run
 
@@ -71,6 +73,10 @@ RAMA_PG_AUTH=scram \
 # transaction pooling: many clients multiplexed over 8 backend connections
 RAMA_PG_POOL_SIZE=8 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
   RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
+
+# pooling + replica sharding: round-robin transactions across two replicas
+RAMA_PG_POOL_SIZE=8 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
+  RAMA_PG_REPLICAS="127.0.0.1:5434,127.0.0.1:5435" cargo run -p rama-pg-example
 ```
 
 Connect through it (SNI comes from the host name; `hostaddr` keeps the dial on
@@ -92,6 +98,7 @@ psql "host=db.example.com hostaddr=127.0.0.1 port=6432 \
 | `RAMA_PG_USERS`   | `user:password` pairs separated by `;` (cleartext)  | —                  |
 | `RAMA_PG_SCRAM_SECRETS` | `user=SCRAM-SHA-256$…` verifiers, `;`-separated (scram) | —          |
 | `RAMA_PG_POOL_SIZE` | max pooled backend connections; enables transaction pooling | — (direct) |
+| `RAMA_PG_REPLICAS` | `host:port` replicas, `,`-separated, to round-robin across (pooling) | `RAMA_PG_BACKEND` |
 
 TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 (which encrypts without verifying the certificate).
@@ -115,8 +122,9 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 - Pooling beyond v1: non-trust backends (the pool's connector can't satisfy a
   credential challenge yet), server reset/`DISCARD ALL` reuse instead of
   discarding a dirty connection, and correctness under cross-transaction
-  pipelining. Per-`(user, database)` pooling already works via the pool key.
-  Read-only sharding (primary/replica split) would extend the key to a shard.
+  pipelining. Per-`(user, database)` pooling and round-robin replica sharding
+  already work via the pool key; a primary/replica read-write split (routing
+  writes to a primary, reads to replicas via query classification) is future.
 - `CancelRequest` routing — it arrives on a *separate* connection carrying a
   PID + secret and must reach the same backend, so it needs a cancel-key map.
 - Direct-TLS (ALPN, client skips `SSLRequest`) and SCRAM-SHA-256-PLUS channel
@@ -131,8 +139,9 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
   CancelRequest), `codec` (tagged frames, `read_message`, and the cancel-safe
   `FramedReader`), `message` (server-message builders).
 - `src/route.rs` — the SNI router.
-- `src/pool.rs` — transaction pooling on rama's client pool: a PG `Connector`
-  through `PooledConnector` / `LruDropPool`, keyed on `(user, database)`.
+- `src/pool.rs` — transaction pooling + replica sharding on rama's client pool:
+  a PG `Connector` through `PooledConnector` / `LruDropPool`, keyed on
+  `(user, database, replica)`, round-robining transactions across replicas.
 - `src/auth.rs` — the `Authenticator` trait, the `ClientAuth`/`BackendAuth`
   outcomes, the pass-through mechanism, and cleartext termination over a
   pluggable async `PasswordValidator`.
