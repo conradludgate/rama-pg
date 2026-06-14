@@ -77,22 +77,58 @@ impl Authenticator for PassThrough {
     }
 }
 
-/// Cleartext-password termination: the proxy plays the auth server, asking the
-/// client for a cleartext password (safe only over TLS, which the proxy
-/// enforces) and checking it against a static credential map. On success the
-/// proxy connects to a trust backend ([`BackendAuth::Trust`]).
+/// Validates the cleartext secret a client supplies via the `PasswordMessage`.
+///
+/// This is the seam for credential checks of any shape: a static password map,
+/// or — since it is async — a token validator that fetches JWKS to verify a JWT
+/// carried as the password (the common managed-Postgres pattern). The `password`
+/// is the raw secret with its terminating nul stripped.
+pub trait PasswordValidator: Send + Sync + 'static {
+    fn validate(
+        &self,
+        ctx: &AuthContext<'_>,
+        password: &[u8],
+    ) -> impl Future<Output = Result<bool, BoxError>> + Send;
+}
+
+/// An in-memory [`PasswordValidator`] checking against a `user -> password` map.
 #[derive(Debug, Clone, Default)]
-pub struct CleartextPassword {
+pub struct StaticPasswordValidator {
     credentials: HashMap<String, String>,
 }
 
-impl CleartextPassword {
+impl StaticPasswordValidator {
     pub fn new(credentials: HashMap<String, String>) -> Self {
         Self { credentials }
     }
 }
 
-impl Authenticator for CleartextPassword {
+impl PasswordValidator for StaticPasswordValidator {
+    async fn validate(&self, ctx: &AuthContext<'_>, password: &[u8]) -> Result<bool, BoxError> {
+        let user = ctx.startup.user().unwrap_or_default();
+        Ok(self
+            .credentials
+            .get(user)
+            .is_some_and(|expected| expected.as_bytes() == password))
+    }
+}
+
+/// Cleartext-password termination: the proxy plays the auth server, asking the
+/// client for a cleartext password (safe only over TLS, which the proxy
+/// enforces) and checking it with a pluggable [`PasswordValidator`]. On success
+/// the proxy connects to a trust backend ([`BackendAuth::Trust`]).
+#[derive(Debug, Clone)]
+pub struct CleartextPassword<V> {
+    validator: V,
+}
+
+impl<V: PasswordValidator> CleartextPassword<V> {
+    pub fn new(validator: V) -> Self {
+        Self { validator }
+    }
+}
+
+impl<V: PasswordValidator> Authenticator for CleartextPassword<V> {
     async fn authenticate<IO>(
         &self,
         client: &mut IO,
@@ -117,12 +153,8 @@ impl Authenticator for CleartextPassword {
 
         let user = ctx.startup.user().unwrap_or_default();
         let supplied = password_bytes(msg.payload());
-        let accepted = self
-            .credentials
-            .get(user)
-            .is_some_and(|expected| expected.as_bytes() == supplied);
 
-        if accepted {
+        if self.validator.validate(ctx, supplied).await? {
             tracing::info!(user, "client authenticated (cleartext, terminated)");
             Ok(ClientAuth::Terminated(BackendAuth::Trust))
         } else {
@@ -147,17 +179,17 @@ fn password_bytes(payload: &[u8]) -> &[u8] {
     }
 }
 
-/// A runtime-selected authenticator, dispatching to a concrete mechanism. The
-/// SCRAM variant is generic over the secret store (defaulting to the in-memory
-/// [`StaticSecretStore`]).
+/// A runtime-selected authenticator, dispatching to a concrete mechanism.
+/// Generic over the cleartext validator `V` and the SCRAM secret store `S`,
+/// both defaulting to the in-memory implementations.
 #[derive(Debug, Clone)]
-pub enum Auth<S = StaticSecretStore> {
+pub enum Auth<V = StaticPasswordValidator, S = StaticSecretStore> {
     PassThrough(PassThrough),
-    Cleartext(CleartextPassword),
+    Cleartext(CleartextPassword<V>),
     Scram(ScramSha256<S>),
 }
 
-impl<S: ScramSecretStore> Authenticator for Auth<S> {
+impl<V: PasswordValidator, S: ScramSecretStore> Authenticator for Auth<V, S> {
     async fn authenticate<IO>(
         &self,
         client: &mut IO,
@@ -188,10 +220,10 @@ mod tests {
         }
     }
 
-    fn alice_creds() -> CleartextPassword {
+    fn alice_creds() -> CleartextPassword<StaticPasswordValidator> {
         let mut creds = HashMap::new();
         creds.insert("alice".to_owned(), "secret".to_owned());
-        CleartextPassword::new(creds)
+        CleartextPassword::new(StaticPasswordValidator::new(creds))
     }
 
     /// Drive the client side of a cleartext exchange: assert the request, then

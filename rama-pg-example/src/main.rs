@@ -12,7 +12,7 @@ use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
-use rama_pg::auth::{Auth, CleartextPassword, PassThrough};
+use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
 use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
@@ -82,7 +82,7 @@ fn build_auth() -> Auth {
         Ok("cleartext") => {
             let credentials = parse_users();
             tracing::info!(users = credentials.len(), "auth mode: cleartext (terminate)");
-            Auth::Cleartext(CleartextPassword::new(credentials))
+            Auth::Cleartext(CleartextPassword::new(StaticPasswordValidator::new(credentials)))
         }
         Ok("scram") => {
             let store = build_scram_store();

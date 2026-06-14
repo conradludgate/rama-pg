@@ -25,8 +25,10 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
 5. **Pluggable auth** — an `Authenticator` trait, with two mechanisms today:
    - `PassThrough` — relay the auth exchange so the *backend* authenticates the
      client. Works with any backend mechanism, including SCRAM-SHA-256.
-   - `CleartextPassword` — the proxy *terminates* auth itself against a static
-     credential map, then dials the backend and splices its startup result
+   - `CleartextPassword` — the proxy *terminates* auth itself, checking the
+     supplied secret with a pluggable, async `PasswordValidator` (a static map,
+     or e.g. a JWKS-fetching JWT validator since a JWT rides the cleartext
+     password), then dials a trust backend and splices its startup result
      (`AuthenticationOk` … `ReadyForQuery`) back to the client.
    - `ScramSha256` — the proxy runs the full SCRAM-SHA-256 (RFC 5802/7677) SASL
      exchange as the server, using a verifier from a pluggable, async
@@ -83,11 +85,13 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 
 ## Not yet implemented
 
-- More auth mechanisms: JWT-as-cleartext-password validation, mTLS,
-  `OAUTHBEARER`. The `cleartext` mechanism still terminates to a trust backend
-  (only SCRAM does upstream reauth); SASLprep password normalisation is also
-  future work. A live `pg_authid`/control-plane `ScramSecretStore` (beyond the
-  in-memory `StaticSecretStore`) is a natural next drop-in.
+- More auth mechanisms: mTLS and `OAUTHBEARER`. (JWT-over-cleartext needs no
+  built-in mechanism — supply a `PasswordValidator` that verifies the token
+  against JWKS.) The `cleartext` mechanism still terminates to a trust backend
+  (only SCRAM does upstream reauth); SASLprep password normalisation is future
+  work. Concrete `ScramSecretStore` / `PasswordValidator` implementations (live
+  `pg_authid`, a control plane, JWKS fetching) are intentionally left to the
+  user behind the async traits.
 - Session / transaction pooling (return the backend to a pool at transaction
   boundaries by tracking the `ReadyForQuery` status `I`/`T`/`E`) and read-only
   sharding (primary/replica split).
@@ -106,7 +110,8 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
   `message` (server-message builders).
 - `src/route.rs` — the SNI router.
 - `src/auth.rs` — the `Authenticator` trait, the `ClientAuth`/`BackendAuth`
-  outcomes, and the pass-through / cleartext mechanisms.
+  outcomes, the pass-through mechanism, and cleartext termination over a
+  pluggable async `PasswordValidator`.
 - `src/scram/` — SCRAM-SHA-256: `crypto` (primitives + key recovery), `secret`
   (the verifier + async `ScramSecretStore`), the server-side authenticator
   (`mod.rs`), and `client` (upstream reauth).
