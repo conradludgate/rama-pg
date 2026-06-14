@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use rama::error::BoxError;
 use rama::net::tls::server::SelfSignedData;
+use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough};
@@ -22,7 +23,7 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     // Self-signed cert for now; real SNI-matched certs arrive with routing.
-    let tls = TlsAcceptorDataBuilder::new_self_signed(SelfSignedData::default())?.build();
+    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?.build();
 
     let router = Arc::new(build_router());
     if router.is_empty() {
@@ -30,13 +31,14 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let auth = Arc::new(build_auth());
+    let proxy = Arc::new(PgProxy::new(tls, router, auth));
 
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");
 
-    TcpListener::bind(listen.as_str())
+    TcpListener::bind_address(listen.as_str(), Executor::new())
         .await?
-        .serve(PgProxy::new(tls, router, auth))
+        .serve(proxy)
         .await;
 
     Ok(())

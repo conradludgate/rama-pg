@@ -9,13 +9,13 @@
 
 use std::sync::Arc;
 
+use rama::Service;
 use rama::error::BoxError;
-use rama::net::stream::Stream;
+use rama::extensions::ExtensionsRef;
 use rama::net::tls::SecureTransport;
-use rama::tcp::TcpStream;
-use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService};
-use rama::{Context, Service};
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
+use rama::tcp::{TcpStream, TokioTcpStream};
+use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use crate::auth::{Authenticator, ClientAuth};
 use crate::protocol::codec::{self, read_message};
@@ -32,23 +32,22 @@ impl<A: Authenticator> PgProxy<A> {
     /// Build a proxy that terminates TLS with the given acceptor data, routes
     /// on `router`, and authenticates clients with `auth`.
     pub fn new(tls: TlsAcceptorData, router: Arc<Router>, auth: Arc<A>) -> Self {
-        // `store_client_hello = true` so the SNI is captured into the context
-        // for routing.
+        // `store_client_hello = true` so the SNI is captured into the TLS
+        // stream's extensions for routing.
         Self {
             tls: TlsAcceptorService::new(tls, PgSession::new(router, auth), true),
         }
     }
 }
 
-impl<State, A> Service<State, TcpStream> for PgProxy<A>
+impl<A> Service<TcpStream> for PgProxy<A>
 where
-    State: Clone + Send + Sync + 'static,
     A: Authenticator,
 {
-    type Response = ();
+    type Output = ();
     type Error = BoxError;
 
-    async fn serve(&self, ctx: Context<State>, mut stream: TcpStream) -> Result<(), BoxError> {
+    async fn serve(&self, mut stream: TcpStream) -> Result<(), BoxError> {
         loop {
             match read_startup_request(&mut stream).await? {
                 StartupRequest::Ssl => {
@@ -57,7 +56,7 @@ where
                     // already consumed (the SSLRequest) don't get in its way.
                     stream.write_all(b"S").await?;
                     stream.flush().await?;
-                    return self.tls.serve(ctx, stream).await;
+                    return self.tls.serve(stream).await;
                 }
                 StartupRequest::GssEnc => {
                     // GSSAPI encryption is unsupported; decline so the client
@@ -103,18 +102,19 @@ impl<A> PgSession<A> {
     }
 }
 
-impl<State, IO, A> Service<State, IO> for PgSession<A>
+impl<A> Service<TlsStream<TcpStream>> for PgSession<A>
 where
-    State: Clone + Send + Sync + 'static,
-    IO: Stream + Unpin,
     A: Authenticator,
 {
-    type Response = ();
+    type Output = ();
     type Error = BoxError;
 
-    async fn serve(&self, ctx: Context<State>, mut stream: IO) -> Result<(), BoxError> {
-        let sni = ctx
-            .get::<SecureTransport>()
+    async fn serve(&self, mut stream: TlsStream<TcpStream>) -> Result<(), BoxError> {
+        // The TLS acceptor stored the ClientHello (and thus SNI) in the stream's
+        // extensions.
+        let sni = stream
+            .extensions()
+            .get_ref::<SecureTransport>()
             .and_then(|t| t.client_hello())
             .and_then(|hello| hello.ext_server_name())
             .map(|host| host.to_string());
@@ -151,7 +151,7 @@ where
         // Authenticate the client; the outcome decides how we reach the backend.
         let outcome = self.auth.authenticate(&mut stream, &msg).await?;
 
-        let mut upstream = match TcpStream::connect(&address).await {
+        let mut upstream = match TokioTcpStream::connect(&address).await {
             Ok(stream) => stream,
             Err(err) => {
                 tracing::error!(%address, %err, "failed to connect to backend");
@@ -186,8 +186,8 @@ where
 /// error.
 async fn relay_backend_startup<C, B>(client: &mut C, backend: &mut B) -> Result<(), BoxError>
 where
-    C: Stream + Unpin,
-    B: Stream + Unpin,
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
         let msg = read_message(backend).await?;
@@ -232,7 +232,7 @@ fn auth_subtype(msg: &codec::RawMessage) -> Result<i32, BoxError> {
 /// rather than seeing a bare connection drop.
 async fn reject<IO>(stream: &mut IO, code: &str, message: &str) -> Result<(), BoxError>
 where
-    IO: Stream + Unpin,
+    IO: AsyncWrite + Unpin,
 {
     let err = fatal_error(code, message);
     stream.write_all(&err).await?;

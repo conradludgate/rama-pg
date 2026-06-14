@@ -1,6 +1,7 @@
 # rama-pg
 
-A Postgres wire-protocol proxy built on [rama](https://ramaproxy.org) 0.2.
+A Postgres wire-protocol proxy built on [rama](https://ramaproxy.org) (tracking
+git `0.3.0-rc1`).
 
 It exists to test whether rama's `Service`/`Layer` model — built for HTTP/TLS/L4
 — extends cleanly to a non-HTTP L7 protocol with awkward edges: Postgres

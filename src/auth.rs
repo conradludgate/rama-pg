@@ -15,8 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use rama::error::BoxError;
-use rama::net::stream::Stream;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
@@ -41,7 +40,7 @@ pub trait Authenticator: Send + Sync + 'static {
         startup: &StartupMessage,
     ) -> impl Future<Output = Result<ClientAuth, BoxError>> + Send
     where
-        IO: Stream + Unpin;
+        IO: AsyncRead + AsyncWrite + Unpin + Send;
 }
 
 /// Transparent pass-through: the proxy does not interpret auth at all.
@@ -55,7 +54,7 @@ impl Authenticator for PassThrough {
         _startup: &StartupMessage,
     ) -> Result<ClientAuth, BoxError>
     where
-        IO: Stream + Unpin,
+        IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
         Ok(ClientAuth::PassThrough)
     }
@@ -83,7 +82,7 @@ impl Authenticator for CleartextPassword {
         startup: &StartupMessage,
     ) -> Result<ClientAuth, BoxError>
     where
-        IO: Stream + Unpin,
+        IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
         client
             .write_all(&message::authentication_cleartext_password())
@@ -145,7 +144,7 @@ impl Authenticator for Auth {
         startup: &StartupMessage,
     ) -> Result<ClientAuth, BoxError>
     where
-        IO: Stream + Unpin,
+        IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
         match self {
             Auth::PassThrough(a) => a.authenticate(client, startup).await,
