@@ -1,5 +1,5 @@
 [workspace]
-members = ["rama-pg-example"]
+members = ["rama-pg-example", "pgbouncer"]
 
 [workspace.dependencies]
 rama = { git = "https://github.com/plabayo/rama", rev = "c0a7afb6249996274bb56b978c22c2e85b41b3ae", features = ["tcp", "rustls", "ring"] }

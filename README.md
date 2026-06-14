@@ -50,6 +50,7 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
    `ParameterStatus`, and relays via a cancel-safe `FramedReader`. With several
    replica addresses, transactions are round-robined across them (read
    load-balancing — a multi-statement transaction stays pinned to one replica).
+   Three pgbouncer-style modes (`PoolMode`): session, transaction, statement.
 8. **Custom in-proxy queries** (optional) — a "virtual Postgres" with no backend
    at all: a pluggable async `QueryHandler` answers simple-protocol queries, the
    proxy synthesizes the startup and encodes `RowDescription`/`DataRow`/
@@ -89,6 +90,21 @@ RAMA_PG_CUSTOM=1 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
   cargo run -p rama-pg-example
 ```
 
+### pgbouncer-like example
+
+The `pgbouncer` crate composes the above into a small pgbouncer-alike: SCRAM
+auth with verifiers fetched from `pg_authid` on demand, pooling (session /
+transaction / statement), and an admin console on the `pgbouncer` database
+answering `SHOW POOLS` / `CLIENTS` / `STATS` / `LISTS` / `VERSION`.
+
+```sh
+RAMA_PG_BACKEND=127.0.0.1:5434 RAMA_PG_POOL_MODE=transaction cargo run -p pgbouncer
+# real database — SCRAM auth (verifier from pg_authid), then pooled:
+psql "host=h hostaddr=127.0.0.1 port=6432 user=alice dbname=shop sslmode=require"
+# admin console:
+psql "host=h hostaddr=127.0.0.1 port=6432 user=alice dbname=pgbouncer sslmode=require" -c "SHOW POOLS"
+```
+
 Connect through it (SNI comes from the host name; `hostaddr` keeps the dial on
 localhost):
 
@@ -109,6 +125,7 @@ psql "host=db.example.com hostaddr=127.0.0.1 port=6432 \
 | `RAMA_PG_SCRAM_SECRETS` | `user=SCRAM-SHA-256$…` verifiers, `;`-separated (scram) | —          |
 | `RAMA_PG_POOL_SIZE` | max pooled backend connections; enables transaction pooling | — (direct) |
 | `RAMA_PG_REPLICAS` | `host:port` replicas, `,`-separated, to round-robin across (pooling) | `RAMA_PG_BACKEND` |
+| `RAMA_PG_POOL_MODE` | `session`, `transaction`, or `statement` (pooling) | `transaction` |
 | `RAMA_PG_CUSTOM` | if set, answer queries in-proxy with no backend (virtual server) | — |
 
 TLS currently uses a self-signed certificate, so connect with `sslmode=require`
@@ -127,9 +144,9 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
   mechanism — supply a `PasswordValidator` that verifies the token against
   JWKS.) The `cleartext` mechanism still terminates to a trust backend (only
   SCRAM does upstream reauth); SASLprep password normalisation is future work.
-  Concrete `ScramSecretStore` / `PasswordValidator` implementations (live
-  `pg_authid`, a control plane, JWKS fetching) are intentionally left to the
-  user behind the async traits.
+  A `PgAuthidStore` ships (fetches verifiers from `pg_authid` on demand); other
+  `ScramSecretStore` / `PasswordValidator` implementations (control plane, JWKS
+  fetching) are left to the user behind the async traits.
 - Pooling beyond v1: non-trust backends (the pool's connector can't satisfy a
   credential challenge yet), server reset/`DISCARD ALL` reuse instead of
   discarding a dirty connection, and correctness under cross-transaction
@@ -143,8 +160,7 @@ TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 
 ## Layout
 
-A Cargo workspace: the `rama-pg` library at the root, and a thin
-`rama-pg-example` binary crate that wires it up.
+A Cargo workspace: the `rama-pg` library at the root, plus two example binaries.
 
 - `src/protocol/` — wire types: `startup` (SSLRequest / StartupMessage /
   CancelRequest), `codec` (tagged frames, `read_message`, and the cancel-safe
@@ -160,10 +176,13 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
   pluggable async `PasswordValidator`.
 - `src/scram/` — SCRAM-SHA-256: `crypto` (primitives + key recovery), `secret`
   (the verifier + async `ScramSecretStore`), the server-side authenticator
-  (`mod.rs`), and `client` (upstream reauth).
+  (`mod.rs`), `client` (upstream reauth), and `authid` (`PgAuthidStore`).
 - `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth, then a
   forwarding **leaf `rama::Service`** over a `PgClient`. The three modes
   (`DirectForwarder` / `PooledForwarder` / `CustomForwarder`) are `Service`
   impls selected via `BoxService`; `PgProxy::with_forwarder` takes any
   `Service<PgClient<…>>`, so a new mode is "write a `Service`", not a new branch.
 - `rama-pg-example/` — the runnable proxy binary (env-driven configuration).
+- `pgbouncer/` — a pgbouncer-like example composing it all via
+  `PgProxy::with_forwarder`: a database-routing forwarder (admin console vs.
+  pool), `pg_authid` SCRAM auth, pooling modes, and `SHOW` commands.
