@@ -45,6 +45,8 @@ pub fn recover_client_key(proof: &[u8; 32], client_signature: &[u8; 32]) -> [u8;
 }
 
 /// `ClientProof = ClientKey XOR ClientSignature`.
+// Used by the upstream SCRAM client (reauth) and the crypto tests.
+#[allow(dead_code)]
 pub fn client_proof(client_key: &[u8; 32], client_signature: &[u8; 32]) -> [u8; 32] {
     let mut proof = [0u8; 32];
     for i in 0..32 {

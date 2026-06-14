@@ -14,8 +14,10 @@
 //! ASCII), and unknown users are rejected without mock-authentication timing.
 
 mod crypto;
+mod secret;
 
 pub use crypto::ScramKeys;
+pub use secret::{ScramSecret, ScramSecretStore, SecretLookup, StaticSecretStore};
 
 use std::collections::HashMap;
 
