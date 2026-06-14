@@ -7,6 +7,10 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.11"
+base64 = "0.22"
+subtle = "2"
+rand = "0.10"
 rama-pg = { path = "." }
 
 [package]
@@ -19,3 +23,7 @@ rama = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }

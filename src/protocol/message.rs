@@ -12,6 +12,12 @@ use super::codec::{AUTHENTICATION, ERROR_RESPONSE, frame};
 const AUTH_OK: i32 = 0;
 /// `Authentication` sub-type: the client must send a cleartext password.
 const AUTH_CLEARTEXT_PASSWORD: i32 = 3;
+/// `Authentication` sub-type: begin a SASL exchange (`AuthenticationSASL`).
+const AUTH_SASL: i32 = 10;
+/// `Authentication` sub-type: SASL challenge (`AuthenticationSASLContinue`).
+const AUTH_SASL_CONTINUE: i32 = 11;
+/// `Authentication` sub-type: SASL completion (`AuthenticationSASLFinal`).
+const AUTH_SASL_FINAL: i32 = 12;
 
 /// Build an `AuthenticationOk` frame.
 pub fn authentication_ok() -> BytesMut {
@@ -23,6 +29,36 @@ pub fn authentication_ok() -> BytesMut {
 /// because the client link is TLS).
 pub fn authentication_cleartext_password() -> BytesMut {
     frame(AUTHENTICATION, &AUTH_CLEARTEXT_PASSWORD.to_be_bytes())
+}
+
+/// Build an `AuthenticationSASL` frame offering the given SASL `mechanisms`.
+/// The mechanism list is a sequence of cstrings terminated by an empty one.
+pub fn authentication_sasl(mechanisms: &[&str]) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(AUTH_SASL);
+    for mechanism in mechanisms {
+        body.extend_from_slice(mechanism.as_bytes());
+        body.put_u8(0);
+    }
+    body.put_u8(0); // terminating empty mechanism name
+    frame(AUTHENTICATION, &body)
+}
+
+/// Build an `AuthenticationSASLContinue` frame carrying SASL challenge `data`.
+pub fn authentication_sasl_continue(data: &[u8]) -> BytesMut {
+    sasl_message(AUTH_SASL_CONTINUE, data)
+}
+
+/// Build an `AuthenticationSASLFinal` frame carrying SASL completion `data`.
+pub fn authentication_sasl_final(data: &[u8]) -> BytesMut {
+    sasl_message(AUTH_SASL_FINAL, data)
+}
+
+fn sasl_message(subtype: i32, data: &[u8]) -> BytesMut {
+    let mut body = BytesMut::with_capacity(data.len() + 4);
+    body.put_i32(subtype);
+    body.extend_from_slice(data);
+    frame(AUTHENTICATION, &body)
 }
 
 /// Build a fatal `ErrorResponse` frame.

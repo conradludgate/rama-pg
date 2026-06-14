@@ -1515,8 +1515,12 @@ dependencies = [
 name = "rama-pg"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "rama",
+ "rand",
+ "sha2",
+ "subtle",
  "tokio",
  "tracing",
 ]
