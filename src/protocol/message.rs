@@ -1,14 +1,12 @@
 //! Server-to-client message builders.
 //!
-//! In the regular protocol phase every message is `Int8 tag`, `Int32 length`
-//! (inclusive of itself, excluding the tag), then the body. For now we only
-//! need to construct an `ErrorResponse`; the general tagged-frame codec lands
-//! with the proxying work.
+//! These construct specific frames on top of the generic framing in
+//! [`crate::protocol::codec`]. For now we only need an `ErrorResponse`; auth
+//! messages join as that work lands.
 
 use bytes::{BufMut, BytesMut};
 
-/// `ErrorResponse` message tag.
-pub const ERROR_RESPONSE: u8 = b'E';
+use super::codec::{ERROR_RESPONSE, frame};
 
 /// Build a fatal `ErrorResponse` frame.
 ///
@@ -31,15 +29,6 @@ pub fn error_response(severity: &str, code: &str, message: &str) -> BytesMut {
     body.put_u8(0); // terminator
 
     frame(ERROR_RESPONSE, &body)
-}
-
-/// Wrap a body in the `tag` + `Int32 length` envelope.
-fn frame(tag: u8, body: &[u8]) -> BytesMut {
-    let mut out = BytesMut::with_capacity(body.len() + 5);
-    out.put_u8(tag);
-    out.put_i32((body.len() + 4) as i32);
-    out.extend_from_slice(body);
-    out
 }
 
 fn put_field(buf: &mut BytesMut, field_type: u8, value: &str) {

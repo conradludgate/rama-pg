@@ -9,7 +9,7 @@
 
 use std::io;
 
-use bytes::Buf;
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Postgres protocol 3.0 version number, sent as the code of a `StartupMessage`.
@@ -76,37 +76,62 @@ impl StartupMessage {
     }
 }
 
-/// Read a single startup-phase packet from `reader`.
+/// Read a single startup-phase packet from `reader` and parse it.
 ///
-/// Reads the length prefix, then exactly `length - 4` further bytes, and
-/// dispatches on the code. Returns an [`io::ErrorKind::InvalidData`] error for a
-/// malformed length or body.
+/// Convenience over [`read_startup_frame`] + [`StartupRequest::parse`] for the
+/// cases where the raw bytes aren't needed (e.g. the local SSLRequest shim).
 pub async fn read_startup_request<R>(reader: &mut R) -> io::Result<StartupRequest>
 where
     R: AsyncRead + Unpin,
 {
+    let frame = read_startup_frame(reader).await?;
+    StartupRequest::parse(&frame)
+}
+
+/// Read a startup-phase frame, returning the complete on-wire bytes (the 4-byte
+/// length prefix followed by the body).
+///
+/// Returning the raw frame lets the proxy forward a `StartupMessage` to a
+/// backend verbatim, rather than re-serializing it.
+pub async fn read_startup_frame<R>(reader: &mut R) -> io::Result<BytesMut>
+where
+    R: AsyncRead + Unpin,
+{
     let len = reader.read_i32().await?;
-    if len < 8 || len > MAX_STARTUP_PACKET_LEN {
+    if !(8..=MAX_STARTUP_PACKET_LEN).contains(&len) {
         return Err(invalid(format!("invalid startup packet length: {len}")));
     }
 
-    let mut body = vec![0u8; (len - 4) as usize];
-    reader.read_exact(&mut body).await?;
+    let mut frame = BytesMut::with_capacity(len as usize);
+    frame.put_i32(len);
+    frame.resize(len as usize, 0);
+    reader.read_exact(&mut frame[4..]).await?;
+    Ok(frame)
+}
 
-    let mut buf = &body[..];
-    let code = buf.get_i32();
+impl StartupRequest {
+    /// Parse a startup-phase frame (as produced by [`read_startup_frame`]),
+    /// dispatching on the code in the version field.
+    pub fn parse(frame: &[u8]) -> io::Result<StartupRequest> {
+        if frame.len() < 8 {
+            return Err(invalid("startup frame shorter than 8 bytes"));
+        }
+        let len = i32::from_be_bytes(frame[..4].try_into().unwrap());
+        let mut buf = &frame[4..];
+        let code = buf.get_i32();
 
-    match code {
-        SSL_REQUEST_CODE if len == 8 => Ok(StartupRequest::Ssl),
-        GSSENC_REQUEST_CODE if len == 8 => Ok(StartupRequest::GssEnc),
-        CANCEL_REQUEST_CODE if len == 16 => Ok(StartupRequest::Cancel(CancelRequest {
-            process_id: buf.get_i32(),
-            secret_key: buf.get_i32(),
-        })),
-        version => Ok(StartupRequest::Startup(StartupMessage {
-            protocol_version: version,
-            parameters: parse_parameters(buf)?,
-        })),
+        match code {
+            SSL_REQUEST_CODE if len == 8 => Ok(StartupRequest::Ssl),
+            GSSENC_REQUEST_CODE if len == 8 => Ok(StartupRequest::GssEnc),
+            CANCEL_REQUEST_CODE if len == 16 => Ok(StartupRequest::Cancel(CancelRequest {
+                process_id: buf.get_i32(),
+                secret_key: buf.get_i32(),
+            })),
+            version => Ok(StartupRequest::Startup(StartupMessage {
+                protocol_version: version,
+                parameters: parse_parameters(buf)?,
+            })),
+        }
     }
 }
 
@@ -217,5 +242,18 @@ mod tests {
     async fn rejects_short_length() {
         let bytes = 4i32.to_be_bytes();
         assert!(parse(&bytes).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn frame_preserves_raw_bytes() {
+        // The raw frame must round-trip byte-for-byte so it can be forwarded
+        // to a backend verbatim.
+        let bytes = encode(PROTOCOL_VERSION_3_0, b"user\0alice\0\0");
+        let frame = read_startup_frame(&mut &bytes[..]).await.unwrap();
+        assert_eq!(&frame[..], &bytes[..]);
+        assert!(matches!(
+            StartupRequest::parse(&frame).unwrap(),
+            StartupRequest::Startup(_)
+        ));
     }
 }
