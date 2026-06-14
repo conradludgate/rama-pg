@@ -7,6 +7,8 @@
 //! then delegates the encrypted stream to a [`TlsAcceptorService`]-wrapped
 //! [`PgSession`] — composing the non-HTTP handshake into rama's service stack.
 
+use std::sync::Arc;
+
 use rama::error::BoxError;
 use rama::net::stream::Stream;
 use rama::net::tls::SecureTransport;
@@ -17,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::protocol::message::fatal_error;
 use crate::protocol::startup::{StartupRequest, read_startup_request};
+use crate::route::Router;
 
 /// Top-level proxy service operating on a raw [`TcpStream`].
 pub struct PgProxy {
@@ -25,12 +28,12 @@ pub struct PgProxy {
 
 impl PgProxy {
     /// Build a proxy that terminates TLS with the given acceptor data and
-    /// hands each established session to [`PgSession`].
-    pub fn new(tls: TlsAcceptorData) -> Self {
+    /// hands each established session to a [`PgSession`] routing on `router`.
+    pub fn new(tls: TlsAcceptorData, router: Arc<Router>) -> Self {
         // `store_client_hello = true` so the SNI is captured into the context
-        // for later routing.
+        // for routing.
         Self {
-            tls: TlsAcceptorService::new(tls, PgSession, true),
+            tls: TlsAcceptorService::new(tls, PgSession::new(router), true),
         }
     }
 }
@@ -84,8 +87,17 @@ where
 }
 
 /// Handles a single connection once TLS is established: reads the
-/// `StartupMessage` and (for now) reports the routing keys before rejecting.
-pub struct PgSession;
+/// `StartupMessage`, resolves a backend from the SNI, and (for now) reports the
+/// chosen route before rejecting.
+pub struct PgSession {
+    router: Arc<Router>,
+}
+
+impl PgSession {
+    pub fn new(router: Arc<Router>) -> Self {
+        Self { router }
+    }
+}
 
 impl<State, IO> Service<State, IO> for PgSession
 where
@@ -102,28 +114,39 @@ where
             .and_then(|hello| hello.ext_server_name())
             .map(|host| host.to_string());
 
-        match read_startup_request(&mut stream).await? {
-            StartupRequest::Startup(msg) => {
-                tracing::info!(
-                    ?sni,
-                    user = ?msg.user(),
-                    database = ?msg.database(),
-                    "startup received over TLS",
-                );
-                // No backend wiring yet (step 1): the handshake is proven, so
-                // reject cleanly with a message the client will surface.
-                reject(
-                    &mut stream,
-                    "08004",
-                    "rama-pg: TLS + startup OK, but no backend is configured yet",
-                )
-                .await
-            }
+        let msg = match read_startup_request(&mut stream).await? {
+            StartupRequest::Startup(msg) => msg,
             other => {
                 tracing::warn!(?other, "unexpected message after TLS handshake");
-                reject(&mut stream, "08P01", "unexpected message after TLS handshake").await
+                return reject(&mut stream, "08P01", "unexpected message after TLS handshake").await;
             }
-        }
+        };
+
+        let Some(backend) = self.router.route(sni.as_deref()) else {
+            tracing::info!(?sni, user = ?msg.user(), "no backend route for SNI");
+            return reject(
+                &mut stream,
+                "08004",
+                "rama-pg: no backend configured for this server name",
+            )
+            .await;
+        };
+
+        tracing::info!(
+            ?sni,
+            user = ?msg.user(),
+            database = ?msg.database(),
+            backend = %backend.address,
+            "resolved route",
+        );
+
+        // Forwarding lands next; for now the route is proven, so reject cleanly.
+        reject(
+            &mut stream,
+            "08004",
+            "rama-pg: route resolved, backend forwarding not wired yet",
+        )
+        .await
     }
 }
 
