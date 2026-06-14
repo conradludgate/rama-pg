@@ -179,11 +179,12 @@ A Cargo workspace: the `rama-pg` library at the root, plus two example binaries.
 - `src/scram/` — SCRAM-SHA-256: `crypto` (primitives + key recovery), `secret`
   (the verifier + async `ScramSecretStore`), the server-side authenticator
   (`mod.rs`), `client` (upstream reauth), and `authid` (`PgAuthidStore`).
-- `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth, then a
-  forwarding **leaf `rama::Service`** over a `PgClient`. The three modes
-  (`DirectForwarder` / `PooledForwarder` / `CustomForwarder`) are `Service`
-  impls selected via `BoxService`; `PgProxy::with_forwarder` takes any
-  `Service<PgClient<…>>`, so a new mode is "write a `Service`", not a new branch.
+- `src/proxy/` — the L4 service: SSL shim → TLS → startup → auth, then a
+  forwarding **leaf `rama::Service`** over a `PgClient`. `mod.rs` holds the
+  front matter (`PgProxy`, `PgSession`, `PgClient`); the three modes are one
+  `Service` impl per file — `direct.rs` / `pooled.rs` / `custom.rs` — selected
+  via `BoxService`. `PgProxy::with_forwarder` takes any `Service<PgClient<…>>`,
+  so a new mode is "write a `Service`", not a new branch.
 - `rama-pg-example/` — the runnable proxy binary (env-driven configuration).
 - `pgbouncer/` — a pgbouncer-like example composing it all via
   `PgProxy::with_forwarder`: a database-routing forwarder (admin console vs.
