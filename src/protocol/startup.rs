@@ -88,6 +88,26 @@ where
     StartupRequest::parse(&frame)
 }
 
+/// Build a `StartupMessage` frame for the given connection `parameters`
+/// (e.g. `[("user", "postgres"), ("database", "postgres")]`). Used when the
+/// proxy opens its own connection to a backend.
+pub fn startup_message(parameters: &[(&str, &str)]) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(PROTOCOL_VERSION_3_0);
+    for (key, value) in parameters {
+        body.extend_from_slice(key.as_bytes());
+        body.put_u8(0);
+        body.extend_from_slice(value.as_bytes());
+        body.put_u8(0);
+    }
+    body.put_u8(0); // end of parameter list
+
+    let mut frame = BytesMut::with_capacity(body.len() + 4);
+    frame.put_i32((body.len() + 4) as i32);
+    frame.extend_from_slice(&body);
+    frame
+}
+
 /// Read a startup-phase frame, returning the complete on-wire bytes (the 4-byte
 /// length prefix followed by the body).
 ///
