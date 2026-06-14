@@ -135,6 +135,7 @@ fn password_bytes(payload: &[u8]) -> &[u8] {
 pub enum Auth {
     PassThrough(PassThrough),
     Cleartext(CleartextPassword),
+    Scram(crate::scram::ScramSha256),
 }
 
 impl Authenticator for Auth {
@@ -149,6 +150,7 @@ impl Authenticator for Auth {
         match self {
             Auth::PassThrough(a) => a.authenticate(client, startup).await,
             Auth::Cleartext(a) => a.authenticate(client, startup).await,
+            Auth::Scram(a) => a.authenticate(client, startup).await,
         }
     }
 }

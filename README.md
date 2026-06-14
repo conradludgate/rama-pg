@@ -28,6 +28,10 @@ The whole connection is one L4 `Service<State, TcpStream>` (`PgProxy`):
    - `CleartextPassword` — the proxy *terminates* auth itself against a static
      credential map, then dials the backend and splices its startup result
      (`AuthenticationOk` … `ReadyForQuery`) back to the client.
+   - `ScramSha256` — the proxy runs the full SCRAM-SHA-256 (RFC 5802/7677) SASL
+     exchange as the server (verifying the client proof, returning a server
+     signature), again terminating and splicing. Crypto is checked against the
+     RFC 7677 vector; channel binding (`-PLUS`) is not offered.
 6. **Direct 1:1 proxy** — forward the `StartupMessage` verbatim, then
    `tokio::io::copy_bidirectional`.
 
@@ -42,6 +46,10 @@ RAMA_PG_LISTEN=127.0.0.1:6432 RAMA_PG_BACKEND=127.0.0.1:5432 \
 
 # proxy-terminated cleartext auth in front of a trust backend
 RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
+  RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
+
+# proxy-terminated SCRAM-SHA-256 auth in front of a trust backend
+RAMA_PG_AUTH=scram RAMA_PG_USERS="alice:secret" \
   RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
 ```
 
@@ -60,16 +68,18 @@ psql "host=db.example.com hostaddr=127.0.0.1 port=6432 \
 | `RAMA_PG_LISTEN`  | listen address                                      | `127.0.0.1:6432`   |
 | `RAMA_PG_BACKEND` | catch-all backend `host:port`                       | —                  |
 | `RAMA_PG_ROUTES`  | exact SNI routes, `sni=host:port` separated by `;`  | —                  |
-| `RAMA_PG_AUTH`    | `passthrough` or `cleartext`                        | `passthrough`      |
-| `RAMA_PG_USERS`   | `user:password` pairs separated by `;` (cleartext)  | —                  |
+| `RAMA_PG_AUTH`    | `passthrough`, `cleartext`, or `scram`              | `passthrough`      |
+| `RAMA_PG_USERS`   | `user:password` pairs separated by `;` (terminate)  | —                  |
 
 TLS currently uses a self-signed certificate, so connect with `sslmode=require`
 (which encrypts without verifying the certificate).
 
 ## Not yet implemented
 
-- More auth mechanisms: SCRAM-SHA-256 termination (terminate-then-reauth),
-  JWT-as-cleartext-password validation, mTLS, `OAUTHBEARER`.
+- More auth mechanisms: JWT-as-cleartext-password validation, mTLS,
+  `OAUTHBEARER`. Terminating auth currently requires a trust/already-satisfied
+  backend — proxy-to-backend *reauth* (e.g. SCRAM with the derived keys) is
+  future work, as is SASLprep password normalisation.
 - Session / transaction pooling (return the backend to a pool at transaction
   boundaries by tracking the `ReadyForQuery` status `I`/`T`/`E`) and read-only
   sharding (primary/replica split).
@@ -87,6 +97,7 @@ A Cargo workspace: the `rama-pg` library at the root, and a thin
   CancelRequest), `codec` (tagged frames + the `read_message` reader),
   `message` (server-message builders).
 - `src/route.rs` — the SNI router.
-- `src/auth.rs` — the `Authenticator` trait and mechanisms.
+- `src/auth.rs` — the `Authenticator` trait and the pass-through / cleartext
+  mechanisms; `src/scram.rs` — the SCRAM-SHA-256 mechanism and its crypto.
 - `src/proxy.rs` — the L4 service: SSL shim → TLS → startup → auth → forward.
 - `rama-pg-example/` — the runnable proxy binary (env-driven configuration).

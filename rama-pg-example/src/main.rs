@@ -15,6 +15,7 @@ use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough};
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
+use rama_pg::scram::ScramSha256;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -72,25 +73,39 @@ fn build_router() -> Router {
 
 /// Select the authenticator from environment configuration:
 ///
-/// - `RAMA_PG_AUTH` — `passthrough` (default) or `cleartext`.
-/// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (cleartext mode).
+/// - `RAMA_PG_AUTH` — `passthrough` (default), `cleartext`, or `scram`.
+/// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (terminate modes).
 fn build_auth() -> Auth {
-    if env::var("RAMA_PG_AUTH").as_deref() == Ok("cleartext") {
-        let mut credentials = HashMap::new();
-        if let Ok(users) = env::var("RAMA_PG_USERS") {
-            for entry in users.split(';').filter(|e| !e.is_empty()) {
-                match entry.split_once(':') {
-                    Some((user, password)) => {
-                        credentials.insert(user.trim().to_owned(), password.to_owned());
-                    }
-                    None => tracing::warn!(entry, "ignoring malformed RAMA_PG_USERS entry"),
+    match env::var("RAMA_PG_AUTH").as_deref() {
+        Ok("cleartext") => {
+            let credentials = parse_users();
+            tracing::info!(users = credentials.len(), "auth mode: cleartext (terminate)");
+            Auth::Cleartext(CleartextPassword::new(credentials))
+        }
+        Ok("scram") => {
+            let credentials = parse_users();
+            tracing::info!(users = credentials.len(), "auth mode: scram-sha-256 (terminate)");
+            Auth::Scram(ScramSha256::new(credentials))
+        }
+        _ => {
+            tracing::info!("auth mode: pass-through");
+            Auth::PassThrough(PassThrough)
+        }
+    }
+}
+
+/// Parse `RAMA_PG_USERS` (`user:password` pairs separated by `;`).
+fn parse_users() -> HashMap<String, String> {
+    let mut credentials = HashMap::new();
+    if let Ok(users) = env::var("RAMA_PG_USERS") {
+        for entry in users.split(';').filter(|e| !e.is_empty()) {
+            match entry.split_once(':') {
+                Some((user, password)) => {
+                    credentials.insert(user.trim().to_owned(), password.to_owned());
                 }
+                None => tracing::warn!(entry, "ignoring malformed RAMA_PG_USERS entry"),
             }
         }
-        tracing::info!(users = credentials.len(), "auth mode: cleartext (terminate)");
-        Auth::Cleartext(CleartextPassword::new(credentials))
-    } else {
-        tracing::info!("auth mode: pass-through");
-        Auth::PassThrough(PassThrough)
     }
+    credentials
 }

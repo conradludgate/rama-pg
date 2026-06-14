@@ -9,3 +9,4 @@ pub mod auth;
 pub mod protocol;
 pub mod proxy;
 pub mod route;
+pub mod scram;
