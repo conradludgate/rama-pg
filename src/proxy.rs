@@ -15,10 +15,10 @@ use rama::net::tls::SecureTransport;
 use rama::tcp::TcpStream;
 use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService};
 use rama::{Context, Service};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 
 use crate::protocol::message::fatal_error;
-use crate::protocol::startup::{StartupRequest, read_startup_request};
+use crate::protocol::startup::{StartupRequest, read_startup_frame, read_startup_request};
 use crate::route::Router;
 
 /// Top-level proxy service operating on a raw [`TcpStream`].
@@ -114,7 +114,9 @@ where
             .and_then(|hello| hello.ext_server_name())
             .map(|host| host.to_string());
 
-        let msg = match read_startup_request(&mut stream).await? {
+        // Keep the raw frame so it can be replayed to the backend verbatim.
+        let startup_frame = read_startup_frame(&mut stream).await?;
+        let msg = match StartupRequest::parse(&startup_frame)? {
             StartupRequest::Startup(msg) => msg,
             other => {
                 tracing::warn!(?other, "unexpected message after TLS handshake");
@@ -131,22 +133,37 @@ where
             )
             .await;
         };
+        let address = backend.address.clone();
 
         tracing::info!(
             ?sni,
             user = ?msg.user(),
             database = ?msg.database(),
-            backend = %backend.address,
-            "resolved route",
+            backend = %address,
+            "routing connection",
         );
 
-        // Forwarding lands next; for now the route is proven, so reject cleanly.
-        reject(
-            &mut stream,
-            "08004",
-            "rama-pg: route resolved, backend forwarding not wired yet",
-        )
-        .await
+        // Direct 1:1 mode: dial the backend, replay the StartupMessage, then
+        // relay bytes transparently. The backend drives auth with the client
+        // through the relay (pass-through), so any auth method it offers works.
+        let mut upstream = match TcpStream::connect(&address).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::error!(%address, %err, "failed to connect to backend");
+                return reject(&mut stream, "08006", "rama-pg: could not reach backend").await;
+            }
+        };
+        upstream.write_all(&startup_frame).await?;
+        upstream.flush().await?;
+
+        let (client_to_backend, backend_to_client) =
+            copy_bidirectional(&mut stream, &mut upstream).await?;
+        tracing::info!(
+            client_to_backend,
+            backend_to_client,
+            "session closed",
+        );
+        Ok(())
     }
 }
 
