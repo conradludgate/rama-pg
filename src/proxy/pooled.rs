@@ -36,7 +36,6 @@ where
     async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
         let PgClient {
             stream,
-            startup_frame,
             startup,
             protocol_version,
             sni,
@@ -52,7 +51,7 @@ where
         let (client_key, handle) = self.cancellation.begin(protocol_version).await?;
         serve_pooled(
             stream,
-            &startup_frame,
+            startup.frame(),
             &user,
             &database,
             auth,

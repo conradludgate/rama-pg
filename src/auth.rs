@@ -240,10 +240,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn startup_for(user: &str) -> StartupMessage {
-        StartupMessage {
-            protocol_version: PROTOCOL_VERSION_3_0,
-            parameters: vec![("user".to_owned(), user.to_owned())],
-        }
+        StartupMessage::new(PROTOCOL_VERSION_3_0, vec![("user".to_owned(), user.to_owned())])
     }
 
     fn alice_creds() -> CleartextPassword<StaticPasswordValidator> {

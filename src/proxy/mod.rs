@@ -56,9 +56,8 @@ use crate::route::Router;
 pub struct PgClient<IO> {
     /// The (TLS) client stream.
     pub stream: IO,
-    /// The raw `StartupMessage` frame, for replaying to a backend verbatim.
-    pub startup_frame: BytesMut,
-    /// The parsed startup parameters.
+    /// The parsed startup parameters (and its raw frame, via `startup.frame()`,
+    /// for replaying to a backend verbatim).
     pub startup: StartupMessage,
     /// The negotiated protocol version (the client's request capped at the
     /// proxy's max). Synthesized modes size their cancel key to it.
@@ -229,9 +228,8 @@ where
             .and_then(|hello| hello.ext_server_name())
             .map(|host| host.to_string());
 
-        // Keep the raw frame so it can be replayed to the backend verbatim.
-        let startup_frame = read_startup_frame(&mut stream).await?;
-        let startup = match StartupRequest::parse(&startup_frame)? {
+        // The parsed StartupMessage keeps its raw frame for verbatim replay.
+        let startup = match StartupRequest::parse(read_startup_frame(&mut stream).await?.freeze())? {
             StartupRequest::Startup(msg) => msg,
             StartupRequest::Cancel(req) => {
                 // Modern libpq (PG 17+) sends the CancelRequest over TLS, honoring
@@ -251,7 +249,7 @@ where
 
         // Only protocol major 3 exists.
         if startup.protocol_major() != 3 {
-            tracing::warn!(version = startup.protocol_version, "unsupported protocol major version");
+            tracing::warn!(version = startup.protocol_version(), "unsupported protocol major version");
             return reject(&mut stream, "0A000", "rama-pg: unsupported protocol major version").await;
         }
         // When the proxy terminates auth it is the negotiation authority: tell the
@@ -261,8 +259,8 @@ where
         let negotiated = startup.negotiated_version();
         if self.auth.terminates() {
             let unsupported: Vec<&str> = startup.pq_options().collect();
-            if negotiated != startup.protocol_version || !unsupported.is_empty() {
-                tracing::info!(requested = startup.protocol_version, negotiated, "negotiating protocol version");
+            if negotiated != startup.protocol_version() || !unsupported.is_empty() {
+                tracing::info!(requested = startup.protocol_version(), negotiated, "negotiating protocol version");
                 stream
                     .write_all(&negotiate_protocol_version(negotiated, &unsupported))
                     .await?;
@@ -281,7 +279,6 @@ where
         self.forwarder
             .serve(PgClient {
                 stream,
-                startup_frame,
                 startup,
                 protocol_version: negotiated,
                 sni,

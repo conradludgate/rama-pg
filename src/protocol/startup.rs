@@ -9,7 +9,7 @@
 
 use std::io;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Postgres protocol 3.0 version number, sent as the code of a `StartupMessage`.
@@ -110,14 +110,39 @@ impl CancelRequest {
 }
 
 /// A `StartupMessage`: the protocol version plus the connection parameters
-/// (notably `user` and `database`).
+/// (notably `user` and `database`). A parsed message also keeps its original
+/// on-wire [`frame`](Self::frame) so the proxy can replay it to a backend
+/// verbatim — no need to carry the raw bytes alongside it.
 #[derive(Debug, Clone, Default)]
 pub struct StartupMessage {
-    pub protocol_version: i32,
-    pub parameters: Vec<(String, String)>,
+    protocol_version: i32,
+    parameters: Vec<(String, String)>,
+    /// The original on-wire frame (empty for a synthetically-built message).
+    raw: Bytes,
 }
 
 impl StartupMessage {
+    /// Build a message with no raw frame, for synthetic use (e.g. tests). A
+    /// *parsed* message instead carries its frame; see [`frame`](Self::frame).
+    pub fn new(protocol_version: i32, parameters: Vec<(String, String)>) -> Self {
+        Self {
+            protocol_version,
+            parameters,
+            raw: Bytes::new(),
+        }
+    }
+
+    /// The original startup frame, to replay to a backend verbatim (empty when
+    /// the message was built synthetically rather than parsed off the wire).
+    pub fn frame(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The requested protocol version code.
+    pub fn protocol_version(&self) -> i32 {
+        self.protocol_version
+    }
+
     /// Look up a startup parameter by key.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.parameters
@@ -174,7 +199,7 @@ where
     R: AsyncRead + Unpin,
 {
     let frame = read_startup_frame(reader).await?;
-    StartupRequest::parse(&frame)
+    StartupRequest::parse(frame.freeze())
 }
 
 /// Build a `StartupMessage` frame for the given connection `parameters`
@@ -232,14 +257,15 @@ where
 
 impl StartupRequest {
     /// Parse a startup-phase frame (as produced by [`read_startup_frame`]),
-    /// dispatching on the code in the version field.
-    pub fn parse(frame: &[u8]) -> io::Result<StartupRequest> {
+    /// dispatching on the code in the version field. Takes the frame by value so a
+    /// `Startup`/`Cancel` can keep it (replayed verbatim / reused as a cancel key)
+    /// without a copy.
+    pub fn parse(frame: Bytes) -> io::Result<StartupRequest> {
         if frame.len() < 8 {
             return Err(invalid("startup frame shorter than 8 bytes"));
         }
         let len = i32::from_be_bytes(frame[..4].try_into().unwrap());
-        let mut buf = &frame[4..];
-        let code = buf.get_i32();
+        let code = i32::from_be_bytes(frame[4..8].try_into().unwrap());
 
         match code {
             SSL_REQUEST_CODE if len == 8 => Ok(StartupRequest::Ssl),
@@ -248,11 +274,12 @@ impl StartupRequest {
             // (pid + Int32 secret), 3.2's is longer. The bytes after the code are
             // captured opaquely.
             CANCEL_REQUEST_CODE if len >= 16 => Ok(StartupRequest::Cancel(CancelRequest {
-                key: CancelKey::from_bytes(Bytes::copy_from_slice(buf)),
+                key: CancelKey::from_bytes(frame.slice(8..)),
             })),
             version => Ok(StartupRequest::Startup(StartupMessage {
                 protocol_version: version,
-                parameters: parse_parameters(buf)?,
+                parameters: parse_parameters(&frame[8..])?,
+                raw: frame,
             })),
         }
     }
@@ -363,10 +390,10 @@ mod tests {
     }
 
     fn startup(version: i32, params: &[(&str, &str)]) -> StartupMessage {
-        StartupMessage {
-            protocol_version: version,
-            parameters: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-        }
+        StartupMessage::new(
+            version,
+            params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        )
     }
 
     #[test]
@@ -429,9 +456,10 @@ mod tests {
         let bytes = encode(PROTOCOL_VERSION_3_0, b"user\0alice\0\0");
         let frame = read_startup_frame(&mut &bytes[..]).await.unwrap();
         assert_eq!(&frame[..], &bytes[..]);
-        assert!(matches!(
-            StartupRequest::parse(&frame).unwrap(),
-            StartupRequest::Startup(_)
-        ));
+        // The parsed StartupMessage carries the original frame verbatim.
+        match StartupRequest::parse(frame.freeze()).unwrap() {
+            StartupRequest::Startup(msg) => assert_eq!(msg.frame(), &bytes[..]),
+            other => panic!("expected startup, got {other:?}"),
+        }
     }
 }

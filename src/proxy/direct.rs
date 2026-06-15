@@ -46,7 +46,6 @@ where
     async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
         let PgClient {
             mut stream,
-            startup_frame,
             startup,
             // Direct mode relays the backend's own version negotiation, so it
             // issues a conservative 8-byte cancel key (valid for any version)
@@ -82,7 +81,7 @@ where
             }
         };
         // Replay the StartupMessage verbatim to the backend.
-        upstream.write_all(&startup_frame).await?;
+        upstream.write_all(startup.frame()).await?;
         upstream.flush().await?;
 
         // Begin a cancel session: `client_key` is advertised to the client, and
