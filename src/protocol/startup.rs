@@ -9,7 +9,7 @@
 
 use std::io;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Postgres protocol 3.0 version number, sent as the code of a `StartupMessage`.
@@ -39,12 +39,26 @@ pub enum StartupRequest {
     Startup(StartupMessage),
 }
 
-/// A `CancelRequest`: identifies the backend connection to cancel by the
-/// process id and secret key the server handed out at connection time.
-#[derive(Debug, Clone, Copy)]
+/// A `CancelRequest`: identifies the backend connection to cancel by the key the
+/// server handed out at connection time (in `BackendKeyData`).
+///
+/// The key is kept opaque — the bytes after the cancel code, i.e. `Int32 pid` +
+/// secret key — because that layout matches a `BackendKeyData` payload exactly
+/// and can be reused verbatim to cancel upstream. It is 8 bytes in protocol 3.0
+/// and longer in 3.2; treating it as bytes keeps both working unchanged.
+#[derive(Debug, Clone)]
 pub struct CancelRequest {
-    pub process_id: i32,
-    pub secret_key: i32,
+    pub key: Bytes,
+}
+
+impl CancelRequest {
+    /// The process id being targeted (the leading `Int32` of the key), for
+    /// logging. `None` if the key is too short.
+    pub fn process_id(&self) -> Option<i32> {
+        self.key
+            .get(..4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+    }
 }
 
 /// A `StartupMessage`: the protocol version plus the connection parameters
@@ -108,6 +122,18 @@ pub fn startup_message(parameters: &[(&str, &str)]) -> BytesMut {
     frame
 }
 
+/// Build a `CancelRequest` startup-phase frame carrying `key` (an `Int32 pid` +
+/// secret key payload — e.g. a backend's captured `BackendKeyData` body). The
+/// key length is not fixed, so a protocol-3.2 long key works unchanged.
+pub fn cancel_request_frame(key: &[u8]) -> BytesMut {
+    let len = 8 + key.len(); // length(4) + cancel code(4) + key
+    let mut frame = BytesMut::with_capacity(len);
+    frame.put_i32(len as i32);
+    frame.put_i32(CANCEL_REQUEST_CODE);
+    frame.extend_from_slice(key);
+    frame
+}
+
 /// Read a startup-phase frame, returning the complete on-wire bytes (the 4-byte
 /// length prefix followed by the body).
 ///
@@ -143,9 +169,11 @@ impl StartupRequest {
         match code {
             SSL_REQUEST_CODE if len == 8 => Ok(StartupRequest::Ssl),
             GSSENC_REQUEST_CODE if len == 8 => Ok(StartupRequest::GssEnc),
-            CANCEL_REQUEST_CODE if len == 16 => Ok(StartupRequest::Cancel(CancelRequest {
-                process_id: buf.get_i32(),
-                secret_key: buf.get_i32(),
+            // `len >= 16` rather than `== 16`: protocol 3.0's key is 8 bytes
+            // (pid + Int32 secret), 3.2's is longer. The bytes after the code are
+            // captured opaquely.
+            CANCEL_REQUEST_CODE if len >= 16 => Ok(StartupRequest::Cancel(CancelRequest {
+                key: Bytes::copy_from_slice(buf),
             })),
             version => Ok(StartupRequest::Startup(StartupMessage {
                 protocol_version: version,
@@ -227,9 +255,34 @@ mod tests {
         let bytes = encode(CANCEL_REQUEST_CODE, &body);
         match parse(&bytes).await.unwrap() {
             StartupRequest::Cancel(c) => {
-                assert_eq!(c.process_id, 42);
-                assert_eq!(c.secret_key, 1337);
+                assert_eq!(c.process_id(), Some(42));
+                assert_eq!(&c.key[..], &body[..]);
             }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_request_frame_round_trips() {
+        // A built CancelRequest parses back to the same opaque key.
+        let key = [0u8, 0, 0, 7, 0xde, 0xad, 0xbe, 0xef];
+        let frame = cancel_request_frame(&key);
+        match read_startup_request(&mut &frame[..]).await.unwrap() {
+            StartupRequest::Cancel(c) => {
+                assert_eq!(&c.key[..], &key[..]);
+                assert_eq!(c.process_id(), Some(7));
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_a_longer_cancel_key() {
+        // A protocol-3.2-style longer key is captured whole (no fixed 16-byte len).
+        let body = vec![0xab; 32];
+        let bytes = encode(CANCEL_REQUEST_CODE, &body);
+        match parse(&bytes).await.unwrap() {
+            StartupRequest::Cancel(c) => assert_eq!(&c.key[..], &body[..]),
             other => panic!("expected cancel, got {other:?}"),
         }
     }

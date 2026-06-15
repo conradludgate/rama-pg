@@ -6,6 +6,7 @@
 //! authenticates and forwards to a backend.
 
 pub mod auth;
+pub mod cancel;
 pub mod pool;
 pub mod protocol;
 pub mod proxy;

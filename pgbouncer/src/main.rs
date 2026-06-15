@@ -25,6 +25,7 @@ use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
+use rama_pg::cancel::NoCancellation;
 use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::{CustomForwarder, PgClient, PgProxy, PooledForwarder};
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
@@ -73,7 +74,15 @@ async fn main() -> Result<(), BoxError> {
         stats,
     };
 
-    let proxy = Arc::new(PgProxy::with_forwarder(tls, auth, forwarder));
+    // Cancellation mediation is wired for direct mode; pooled-mode cancellation
+    // (tracking the backend a client currently holds) is future work, so disable
+    // it here rather than imply it works.
+    let proxy = Arc::new(PgProxy::with_forwarder(
+        tls,
+        auth,
+        forwarder,
+        Arc::new(NoCancellation),
+    ));
     tracing::info!(
         listen = %config.listen,
         backend = %config.backend,

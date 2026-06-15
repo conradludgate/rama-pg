@@ -49,6 +49,7 @@ use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, PassThrough};
+use rama_pg::cancel::RegistryCancellation;
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
 
@@ -63,8 +64,11 @@ async fn main() -> Result<(), BoxError> {
     // Pass-through auth: the *backend* authenticates the client.
     let auth = Arc::new(Auth::PassThrough(PassThrough));
 
+    // Mediate query cancellation with the default in-memory registry.
+    let cancellation = Arc::new(RegistryCancellation::new());
+
     // No pool and no query handler → direct 1:1 forwarding.
-    let proxy = Arc::new(PgProxy::new(tls, router, auth, None, None));
+    let proxy = Arc::new(PgProxy::new(tls, router, auth, None, None, cancellation));
 
     TcpListener::bind_address("127.0.0.1:6432", Executor::new())
         .await?
@@ -187,7 +191,7 @@ let pool = BackendPool::new(
     PoolMode::Transaction,  // Session / Transaction / Statement
 );
 // Pooling terminates auth, so pair it with cleartext or scram (not pass-through):
-let proxy = Arc::new(PgProxy::new(tls, router, auth, Some(pool), None));
+let proxy = Arc::new(PgProxy::new(tls, router, auth, Some(pool), None, cancellation));
 ```
 
 A backend is returned to the pool only at a verified idle boundary, and reset
@@ -221,8 +225,44 @@ impl QueryHandler for Echo {
         })
     }
 }
-// PgProxy::new(tls, router, auth, None, Some(Arc::new(Echo)));
+// PgProxy::new(tls, router, auth, None, Some(Arc::new(Echo)), cancellation);
 ```
+
+### Mediate query cancellation
+
+Cancellation is wired through the `Cancellation` provider passed to `PgProxy`.
+`RegistryCancellation` (used above) mints an opaque cancel key per direct session
+and routes a client's `CancelRequest` to the right backend — nothing else to do.
+Implement the trait to use a different store (e.g. a shared/distributed one):
+
+```rust
+use bytes::Bytes;
+use rama::error::BoxError;
+use rama_pg::cancel::{Cancellation, UpstreamSession};
+
+struct MyCancellation { /* a shared map, Redis client, … */ }
+
+impl Cancellation for MyCancellation {
+    fn issue(&self, upstream: UpstreamSession)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Bytes>, BoxError>> + Send + '_>>
+    {
+        // Record `upstream` (backend + its BackendKeyData) and return the opaque
+        // key to advertise to the client (or None to pass the backend's through).
+        Box::pin(async move { todo!() })
+    }
+
+    fn cancel(&self, key: Bytes)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BoxError>> + Send + '_>>
+    {
+        // Look `key` up and deliver a CancelRequest to the recorded backend.
+        Box::pin(async move { todo!() })
+    }
+}
+```
+
+Cancellation keys are opaque byte strings (a `BackendKeyData` payload reused as a
+`CancelRequest` body), so protocol 3.0's 8-byte key and 3.2's longer key both
+work unchanged. `NoCancellation` disables mediation.
 
 ### Add your own forwarding mode
 
@@ -254,7 +294,7 @@ where
     }
 }
 
-// let proxy = PgProxy::with_forwarder(tls, auth, MyForwarder);
+// let proxy = PgProxy::with_forwarder(tls, auth, MyForwarder, cancellation);
 ```
 
 ---
@@ -264,9 +304,10 @@ where
 ### Core API (`rama_pg::proxy`)
 
 - **`PgProxy`** — the top-level `rama::Service<TcpStream>`. `PgProxy::new(tls,
-  router, auth, pool, handler)` picks a built-in forwarder (custom if `handler`
-  is `Some`, else pooled if `pool` is `Some`, else direct). `PgProxy::with_forwarder(tls,
-  auth, forwarder)` takes any forwarding `Service`.
+  router, auth, pool, handler, cancellation)` picks a built-in forwarder (custom
+  if `handler` is `Some`, else pooled if `pool` is `Some`, else direct).
+  `PgProxy::with_forwarder(tls, auth, forwarder, cancellation)` takes any
+  forwarding `Service`.
 - **`PgClient<IO>`** — an authenticated client handed to a forwarder: the TLS
   `stream`, the raw `startup_frame`, the parsed `startup`, the `sni`, and the
   `auth` outcome.
@@ -304,6 +345,17 @@ where
     discarded (multi-statement transactions break).
 - **`Lease`** — a checked-out backend (`AsyncRead`/`AsyncWrite` + `reset` /
   `checkin` / `discard`).
+
+### Cancellation (`rama_pg::cancel`)
+
+- **`Cancellation`** — the pluggable seam: `issue` (assign the client's cancel
+  key + record the upstream session) and `cancel` (route an incoming
+  `CancelRequest`), plus a `release` cleanup hook.
+- **`RegistryCancellation`** — default in-memory store: opaque random keys,
+  delivering an upstream `CancelRequest` to the recorded backend. Wired for
+  direct mode (pooled-mode cancellation is future work).
+- **`NoCancellation`** — disables mediation. **`UpstreamSession`** — the backend
+  address + its captured key.
 
 ### Custom queries (`rama_pg::query`)
 
@@ -350,6 +402,8 @@ A Cargo workspace: the `rama-pg` library at the root, plus two showcase binaries
   `(user, database, replica)`.
 - `src/query.rs` — the `QueryHandler` trait, `QueryResponse`, and per-connection
   `SessionState` for custom mode.
+- `src/cancel.rs` — the `Cancellation` trait + `RegistryCancellation` /
+  `NoCancellation` for query cancellation.
 - `src/route.rs` — the SNI router.
 - `src/protocol/` — wire types: `startup`, `codec`, `message`.
 - `rama-pg-example/` & `pgbouncer/` — the showcases (see below).
@@ -430,7 +484,9 @@ The whole thing is one L4 `Service<TcpStream>` (`PgProxy`):
 
 1. **Pre-TLS `SSLRequest` shim** — read the plaintext `SSLRequest` (`80877103`),
    reply `S`; decline `GSSENCRequest` so the client falls back to TLS; require
-   TLS (reject plaintext startup).
+   TLS (reject plaintext startup). A plaintext `CancelRequest` (the traditional
+   libpq cancel path) is handed to the `Cancellation` provider here; the over-TLS
+   cancel (libpq 17+) is handled after the handshake.
 2. **Mid-stream TLS upgrade** — hand the *same* socket to rama's
    `TlsAcceptorService`, which reads the ClientHello from the current cursor. The
    SNI lands in the stream's extensions.
@@ -477,8 +533,12 @@ reinventing it:
   future work. Transaction/statement modes reset reused backends with
   `DISCARD ALL`; session-mode connections are still discarded on close rather
   than reused (the relay is opaque, so there's no idle boundary to reset at).
-- **`CancelRequest` routing** — arrives on a separate connection carrying a PID +
-  secret; needs a cancel-key map (not implemented).
+- **`CancelRequest` routing** is implemented for **direct mode** via the
+  pluggable `Cancellation` provider (the proxy mints an opaque cancel key,
+  captures the backend's, and routes a client's `CancelRequest` upstream — over
+  either the plaintext or the over-TLS cancel path). Pooled-mode cancellation
+  (tracking the backend a client currently holds) is future work, as is protocol
+  3.2's longer cancel key (the key types are already byte-opaque for it).
 - **Direct-TLS** (ALPN, client skips `SSLRequest`) is not handled.
 
 ## License

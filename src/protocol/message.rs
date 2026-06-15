@@ -124,6 +124,13 @@ pub fn backend_key_data(process_id: i32, secret_key: i32) -> BytesMut {
     frame(BACKEND_KEY_DATA, &body)
 }
 
+/// Build a `BackendKeyData` frame from a raw payload (`Int32 pid` + secret key),
+/// e.g. a key minted by the cancellation provider. Length-agnostic, so a
+/// protocol-3.2 long key works unchanged.
+pub fn backend_key_data_raw(payload: &[u8]) -> BytesMut {
+    frame(BACKEND_KEY_DATA, payload)
+}
+
 /// Build a `ReadyForQuery` frame with the given transaction status (`I`/`T`/`E`).
 pub fn ready_for_query(status: u8) -> BytesMut {
     frame(READY_FOR_QUERY, &[status])

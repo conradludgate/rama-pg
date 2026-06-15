@@ -15,6 +15,7 @@ use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
+use rama_pg::cancel::RegistryCancellation;
 use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::PgProxy;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
@@ -41,7 +42,10 @@ async fn main() -> Result<(), BoxError> {
     let auth = Arc::new(build_auth());
     let pool = build_pool();
     let handler = build_handler();
-    let proxy = Arc::new(PgProxy::new(tls, router, auth, pool, handler));
+    // In-memory cancellation registry: the proxy mints an opaque cancel key per
+    // direct session and routes CancelRequests to the right backend.
+    let cancellation = Arc::new(RegistryCancellation::new());
+    let proxy = Arc::new(PgProxy::new(tls, router, auth, pool, handler, cancellation));
 
     let listen = env::var("RAMA_PG_LISTEN").unwrap_or_else(|_| "127.0.0.1:6432".to_owned());
     tracing::info!(%listen, "rama-pg listening");

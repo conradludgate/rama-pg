@@ -34,6 +34,7 @@ use rama::tls::rustls::server::{TlsAcceptorData, TlsAcceptorService, TlsStream};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::auth::{AuthContext, Authenticator, ClientAuth};
+use crate::cancel::Cancellation;
 use crate::pool::BackendPool;
 use crate::protocol::message::{authentication_ok, backend_key_data, fatal_error, ready_for_query};
 use crate::protocol::startup::{
@@ -68,6 +69,9 @@ pub type Forwarder = BoxService<PgClient<TlsStream<TcpStream>>, (), BoxError>;
 /// Top-level proxy service operating on a raw [`TcpStream`].
 pub struct PgProxy<A> {
     tls: TlsAcceptorService<PgSession<A>>,
+    /// Handles `CancelRequest`s that arrive in the clear (the traditional libpq
+    /// cancel path). Over-TLS cancels are handled by [`PgSession`].
+    cancellation: Arc<dyn Cancellation>,
 }
 
 impl<A: Authenticator> PgProxy<A> {
@@ -75,33 +79,47 @@ impl<A: Authenticator> PgProxy<A> {
     /// authenticates clients with `auth`. The forwarding mode is chosen by the
     /// optional `handler` (custom in-proxy queries, no backend) and `pool`
     /// (transaction pooling); with neither, it is direct 1:1 on `router`.
+    /// `cancellation` mediates query cancellation (see [`crate::cancel`]).
     pub fn new(
         tls: TlsAcceptorData,
         router: Arc<Router>,
         auth: Arc<A>,
         pool: Option<Arc<BackendPool>>,
         handler: Option<Arc<dyn QueryHandler>>,
+        cancellation: Arc<dyn Cancellation>,
     ) -> Self {
         let forwarder = if let Some(handler) = handler {
             CustomForwarder::new(handler).boxed()
         } else if let Some(pool) = pool {
             PooledForwarder::new(pool).boxed()
         } else {
-            DirectForwarder::new(router).boxed()
+            DirectForwarder::new(router, cancellation.clone()).boxed()
         };
-        Self::with_forwarder(tls, auth, forwarder)
+        Self::with_forwarder(tls, auth, forwarder, cancellation)
     }
 
     /// Build a proxy with a caller-supplied forwarding [`Service`] — the
-    /// composability seam for new modes beyond the built-in three.
-    pub fn with_forwarder<F>(tls: TlsAcceptorData, auth: Arc<A>, forwarder: F) -> Self
+    /// composability seam for new modes beyond the built-in three. `cancellation`
+    /// handles incoming `CancelRequest`s; the forwarder is responsible for
+    /// issuing keys (see [`crate::cancel`]).
+    pub fn with_forwarder<F>(
+        tls: TlsAcceptorData,
+        auth: Arc<A>,
+        forwarder: F,
+        cancellation: Arc<dyn Cancellation>,
+    ) -> Self
     where
         F: Service<PgClient<TlsStream<TcpStream>>, Output = (), Error = BoxError>,
     {
         // `store_client_hello = true` so the SNI is captured into the TLS
         // stream's extensions for routing.
         Self {
-            tls: TlsAcceptorService::new(tls, PgSession::new(auth, forwarder.boxed()), true),
+            tls: TlsAcceptorService::new(
+                tls,
+                PgSession::new(auth, forwarder.boxed(), cancellation.clone()),
+                true,
+            ),
+            cancellation,
         }
     }
 }
@@ -141,12 +159,12 @@ where
                     return Ok(());
                 }
                 StartupRequest::Cancel(req) => {
-                    // CancelRequest routing needs a cancel-key map; out of scope
-                    // for v1 (a known gap), so acknowledge by closing.
-                    tracing::info!(
-                        process_id = req.process_id,
-                        "cancel request received (unsupported in v1)"
-                    );
+                    // Traditional libpq sends the CancelRequest in the clear on a
+                    // fresh connection; hand it to the cancellation provider.
+                    tracing::info!(process_id = ?req.process_id(), "cancel request (plaintext)");
+                    if let Err(err) = self.cancellation.cancel(req.key).await {
+                        tracing::warn!(%err, "cancellation failed");
+                    }
                     return Ok(());
                 }
             }
@@ -160,11 +178,16 @@ where
 pub struct PgSession<A> {
     auth: Arc<A>,
     forwarder: Forwarder,
+    cancellation: Arc<dyn Cancellation>,
 }
 
 impl<A> PgSession<A> {
-    fn new(auth: Arc<A>, forwarder: Forwarder) -> Self {
-        Self { auth, forwarder }
+    fn new(auth: Arc<A>, forwarder: Forwarder, cancellation: Arc<dyn Cancellation>) -> Self {
+        Self {
+            auth,
+            forwarder,
+            cancellation,
+        }
     }
 }
 
@@ -189,6 +212,16 @@ where
         let startup_frame = read_startup_frame(&mut stream).await?;
         let startup = match StartupRequest::parse(&startup_frame)? {
             StartupRequest::Startup(msg) => msg,
+            StartupRequest::Cancel(req) => {
+                // Modern libpq (PG 17+) sends the CancelRequest over TLS, honoring
+                // the connection's sslmode, so it arrives here rather than in the
+                // clear. Same provider, different transport.
+                tracing::info!(process_id = ?req.process_id(), "cancel request (over TLS)");
+                if let Err(err) = self.cancellation.cancel(req.key).await {
+                    tracing::warn!(%err, "cancellation failed");
+                }
+                return Ok(());
+            }
             other => {
                 tracing::warn!(?other, "unexpected message after TLS handshake");
                 return reject(&mut stream, "08P01", "unexpected message after TLS handshake").await;
