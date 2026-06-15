@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use rama::Service;
 use rama::error::BoxError;
+use rama::net::tls::ApplicationProtocol;
 use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
@@ -50,7 +51,10 @@ async fn main() -> Result<(), BoxError> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = Config::from_ini(&text)?;
 
-    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?.build();
+    // The `postgresql` ALPN lets direct-TLS (`sslnegotiation=direct`) clients connect.
+    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?
+        .with_alpn_protocols(&[ApplicationProtocol::PostgreSQL])
+        .build();
 
     // SCRAM auth, verifier fetched from pg_authid over an admin connection.
     let auth = Arc::new(ScramSha256::new(PgAuthidStore::new(

@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use rama::error::BoxError;
+use rama::net::tls::ApplicationProtocol;
 use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
@@ -31,8 +32,11 @@ async fn main() -> Result<(), BoxError> {
         )
         .init();
 
-    // Self-signed cert for now; real SNI-matched certs arrive with routing.
-    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?.build();
+    // Self-signed cert for now; real SNI-matched certs arrive with routing. The
+    // `postgresql` ALPN is required for direct-TLS (`sslnegotiation=direct`) clients.
+    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?
+        .with_alpn_protocols(&[ApplicationProtocol::PostgreSQL])
+        .build();
 
     let router = Arc::new(build_router());
     if router.is_empty() {

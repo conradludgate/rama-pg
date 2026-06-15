@@ -138,6 +138,21 @@ where
     type Error = BoxError;
 
     async fn serve(&self, mut stream: TcpStream) -> Result<(), BoxError> {
+        // Direct TLS (PostgreSQL 17+ `sslnegotiation=direct`): the client opens
+        // with a TLS `ClientHello` instead of an `SSLRequest`. A TLS handshake
+        // record starts with `0x16`; a Postgres startup packet starts with `0x00`
+        // (the high byte of its length, capped well under 16 MiB), so the first
+        // byte disambiguates. Peek it without consuming, then hand a ClientHello
+        // straight to the TLS acceptor (no `S` shim). Direct TLS mandates the
+        // `postgresql` ALPN, which the acceptor must advertise.
+        let mut first = [0u8; 1];
+        if let Ok(1) = stream.stream.peek(&mut first).await
+            && first[0] == 0x16
+        {
+            tracing::info!("direct TLS connection (ClientHello first)");
+            return self.tls.serve(stream).await;
+        }
+
         loop {
             match read_startup_request(&mut stream).await? {
                 StartupRequest::Ssl => {

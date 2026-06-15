@@ -492,9 +492,12 @@ rama?", and mostly it can.
 
 The whole thing is one L4 `Service<TcpStream>` (`PgProxy`):
 
-1. **Pre-TLS `SSLRequest` shim** — read the plaintext `SSLRequest` (`80877103`),
-   reply `S`; decline `GSSENCRequest` so the client falls back to TLS; require
-   TLS (reject plaintext startup). A plaintext `CancelRequest` (the traditional
+1. **TLS entry** — peek the first byte: a TLS `ClientHello` (`0x16`) means a
+   *direct-TLS* client (`sslnegotiation=direct`, PG 17+) and goes straight to the
+   acceptor (the acceptor advertises the `postgresql` ALPN that direct TLS
+   mandates). Otherwise it's the classic flow: read the plaintext `SSLRequest`
+   (`80877103`), reply `S`; decline `GSSENCRequest` so the client falls back to
+   TLS; reject a plaintext startup. A plaintext `CancelRequest` (the traditional
    libpq cancel path) is handed to the `Cancellation` provider here; the over-TLS
    cancel (libpq 17+) is handled after the handshake.
 2. **Mid-stream TLS upgrade** — hand the *same* socket to rama's
@@ -553,7 +556,6 @@ reinventing it:
   either the plaintext or the over-TLS cancel path. Protocol versions are
   negotiated (3.0 and 3.2): a synthesized-mode client on 3.2 gets a longer,
   harder-to-guess cancel key; direct modes issue the classic 4-byte key.
-- **Direct-TLS** (ALPN, client skips `SSLRequest`) is not handled.
 
 ## License
 
