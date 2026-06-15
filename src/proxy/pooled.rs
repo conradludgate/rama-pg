@@ -88,9 +88,17 @@ where
     }
 
     // The client is idle until it sends a query, so we don't hold a backend yet;
-    // the pool gives us the (cached) ParameterStatus to replay. Advertise the
-    // cancel key the provider issued, or a throwaway one when it's disabled.
-    let params = pool.startup_params(startup_frame, user, database).await?;
+    // the pool gives us the (cached) ParameterStatus to replay. This is the first
+    // backend contact, so a connection/auth failure surfaces here — report it as a
+    // startup ErrorResponse rather than dropping the connection mid-handshake.
+    let params = match pool.startup_params(startup_frame, user, database).await {
+        Ok(params) => params,
+        Err(err) => {
+            tracing::error!(%err, "backend connection/authentication failed");
+            return reject(&mut stream, "08006", "rama-pg: could not establish a backend connection").await;
+        }
+    };
+    // Advertise the cancel key the provider issued, or a throwaway one when disabled.
     let cancel_key = client_key
         .unwrap_or_else(|| Bytes::copy_from_slice(&rand::random::<u64>().to_be_bytes()));
     synthesize_startup(&mut stream, &params, &cancel_key).await?;

@@ -17,7 +17,7 @@ use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
 use rama_pg::cancel::RegistryCancellation;
-use rama_pg::pool::{BackendPool, PoolMode};
+use rama_pg::pool::{BackendCredentials, BackendPool, PoolMode, StaticBackendCredentials};
 use rama_pg::proxy::PgProxy;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 use rama_pg::route::{Backend, Router};
@@ -102,6 +102,8 @@ fn build_handler() -> Option<Arc<dyn QueryHandler>> {
 /// - `RAMA_PG_POOL_SIZE` — max backend connections (total); enables pooling.
 /// - `RAMA_PG_REPLICAS` — `host:port` replicas separated by `,` to round-robin
 ///   across (falls back to `RAMA_PG_BACKEND` as a single replica).
+/// - `RAMA_PG_BACKEND_USERS` — `user:password` pairs (`;`-separated) the pool
+///   uses to authenticate to non-trust backends (cleartext / scram); unset = trust.
 fn build_pool() -> Option<Arc<BackendPool>> {
     let size: usize = env::var("RAMA_PG_POOL_SIZE").ok()?.parse().ok()?;
     let replicas: Vec<String> = match env::var("RAMA_PG_REPLICAS") {
@@ -121,8 +123,34 @@ fn build_pool() -> Option<Arc<BackendPool>> {
         Ok("statement") => PoolMode::Statement,
         _ => PoolMode::Transaction,
     };
-    tracing::info!(size, ?replicas, ?mode, "pooling enabled");
-    Some(BackendPool::new(replicas, size, mode))
+    match build_backend_credentials() {
+        Some(credentials) => {
+            tracing::info!(size, ?replicas, ?mode, "pooling enabled (authenticated backend)");
+            Some(BackendPool::with_credentials(replicas, size, mode, credentials))
+        }
+        None => {
+            tracing::info!(size, ?replicas, ?mode, "pooling enabled (trust backend)");
+            Some(BackendPool::new(replicas, size, mode))
+        }
+    }
+}
+
+/// Backend credentials for non-trust pooling from `RAMA_PG_BACKEND_USERS`
+/// (`user:password` pairs separated by `;`); `None` keeps trust.
+fn build_backend_credentials() -> Option<Arc<dyn BackendCredentials>> {
+    let raw = env::var("RAMA_PG_BACKEND_USERS").ok()?;
+    let mut creds = StaticBackendCredentials::new();
+    for entry in raw.split(';').filter(|e| !e.is_empty()) {
+        match entry.split_once(':') {
+            Some((user, password)) => creds = creds.with_password(user.trim(), password),
+            None => tracing::warn!(entry, "ignoring malformed RAMA_PG_BACKEND_USERS entry"),
+        }
+    }
+    if creds.is_empty() {
+        None
+    } else {
+        Some(Arc::new(creds))
+    }
 }
 
 /// Build the SNI router from environment configuration:

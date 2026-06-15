@@ -16,10 +16,13 @@
 //! joins the `(user, database)` pool key, so each replica keeps its own
 //! connections.
 //!
-//! v1 scope: trust backends only (the connector can't satisfy a credential
-//! challenge). A single address is just a one-element replica list.
+//! Backends may be trust or password-authenticated: a [`BackendCredentials`]
+//! provider lets the connector satisfy a cleartext or SCRAM-SHA-256 challenge
+//! over the (plaintext) backend link. A single address is just a one-element
+//! replica list.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,8 +89,46 @@ impl ExtensionsRef for BackendRequest {
 
 /// Establishes a fresh backend: dial, replay the `StartupMessage`, drive the
 /// (trust) startup to `ReadyForQuery`, capturing `ParameterStatus`.
-#[derive(Debug, Clone)]
-struct PgConnector;
+struct PgConnector {
+    credentials: Arc<dyn BackendCredentials>,
+}
+
+impl std::fmt::Debug for PgConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConnector").finish_non_exhaustive()
+    }
+}
+
+impl Clone for PgConnector {
+    fn clone(&self) -> Self {
+        Self {
+            credentials: self.credentials.clone(),
+        }
+    }
+}
+
+// `Authentication` sub-types the pool connector handles.
+const AUTH_OK: i32 = 0;
+const AUTH_CLEARTEXT_PASSWORD: i32 = 3;
+const AUTH_MD5_PASSWORD: i32 = 5;
+const AUTH_SASL: i32 = 10;
+
+impl PgConnector {
+    /// The backend password for this request's role, erroring if a challenge
+    /// arrived but no credentials are configured.
+    async fn backend_password(&self, req: &BackendRequest) -> Result<String, BoxError> {
+        self.credentials
+            .password(&req.id.user, &req.id.database)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "backend requires authentication but no credentials are configured for user {:?}",
+                    req.id.user
+                )
+                .into()
+            })
+    }
+}
 
 impl Service<BackendRequest> for PgConnector {
     type Output = EstablishedClientConnection<PooledStream, BackendRequest>;
@@ -98,26 +139,52 @@ impl Service<BackendRequest> for PgConnector {
         conn.write_all(&req.startup).await?;
         conn.flush().await?;
 
+        // Auth phase: satisfy the backend's challenge (trust / cleartext / SCRAM,
+        // over this plaintext link) until `AuthenticationOk`.
+        loop {
+            let msg = read_message(&mut conn).await?;
+            match msg.tag() {
+                codec::AUTHENTICATION => match auth_subtype(&msg) {
+                    AUTH_OK => break,
+                    AUTH_CLEARTEXT_PASSWORD => {
+                        let mut body = self.backend_password(&req).await?.into_bytes();
+                        body.push(0);
+                        conn.write_all(&codec::frame(codec::PASSWORD_MESSAGE, &body)).await?;
+                        conn.flush().await?;
+                    }
+                    AUTH_SASL => {
+                        let password = self.backend_password(&req).await?;
+                        crate::scram::authenticate_password(&mut conn, &msg, &password).await?;
+                    }
+                    AUTH_MD5_PASSWORD => {
+                        return Err("pool backend requested md5 auth; only trust, \
+                                    cleartext, and scram-sha-256 are supported"
+                            .into());
+                    }
+                    other => {
+                        return Err(format!(
+                            "pool backend requested unsupported authentication type {other}"
+                        )
+                        .into());
+                    }
+                },
+                codec::ERROR_RESPONSE => return Err("pool backend rejected authentication".into()),
+                other => {
+                    return Err(format!(
+                        "unexpected backend message during auth: tag {:?}",
+                        other as char
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Post-auth: capture `ParameterStatus` and the cancel key up to `ReadyForQuery`.
         let mut params = Vec::new();
         let mut cancel_key = None;
         loop {
             let msg = read_message(&mut conn).await?;
             match msg.tag() {
-                codec::AUTHENTICATION => {
-                    let payload = msg.payload();
-                    let subtype = if payload.len() >= 4 {
-                        i32::from_be_bytes(payload[..4].try_into().unwrap())
-                    } else {
-                        -1
-                    };
-                    if subtype != 0 {
-                        return Err(format!(
-                            "pool backend requested authentication type {subtype}; \
-                             only a trust backend is supported"
-                        )
-                        .into());
-                    }
-                }
                 codec::PARAMETER_STATUS => params.push(BytesMut::from(msg.as_bytes())),
                 // Capture the backend's cancel key so a client leasing this
                 // connection can be cancelled at whatever backend it lands on.
@@ -137,6 +204,74 @@ impl Service<BackendRequest> for PgConnector {
             }));
         }
         Ok(EstablishedClientConnection { input: req, conn })
+    }
+}
+
+/// The `Int32` sub-type of an `Authentication` message (or `-1` if truncated).
+fn auth_subtype(msg: &codec::RawMessage) -> i32 {
+    let payload = msg.payload();
+    if payload.len() >= 4 {
+        i32::from_be_bytes(payload[..4].try_into().unwrap())
+    } else {
+        -1
+    }
+}
+
+/// Supplies the password the pool uses to authenticate to a backend as a role.
+/// The pool connects to backends over plaintext TCP and may be challenged for a
+/// cleartext or SCRAM-SHA-256 password; returning `None` means a trust backend.
+pub trait BackendCredentials: Send + Sync + 'static {
+    fn password(
+        &self,
+        user: &str,
+        database: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>>;
+}
+
+/// A trust backend: no credentials (the backend must not challenge for auth).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustBackend;
+
+impl BackendCredentials for TrustBackend {
+    fn password(
+        &self,
+        _user: &str,
+        _database: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// In-memory `user -> password` backend credentials.
+#[derive(Debug, Clone, Default)]
+pub struct StaticBackendCredentials {
+    passwords: HashMap<String, String>,
+}
+
+impl StaticBackendCredentials {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the backend password for `user`.
+    pub fn with_password(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
+        self.passwords.insert(user.into(), password.into());
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.passwords.is_empty()
+    }
+}
+
+impl BackendCredentials for StaticBackendCredentials {
+    fn password(
+        &self,
+        user: &str,
+        _database: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>> {
+        let password = self.passwords.get(user).cloned();
+        Box::pin(async move { Ok(password) })
     }
 }
 
@@ -187,7 +322,20 @@ pub struct BackendPool {
 impl BackendPool {
     /// Create a pool of up to `max_size` connections (total, across replicas),
     /// round-robining transactions across `replicas`, with the given pool `mode`.
+    /// Backends are assumed to be trust; use [`with_credentials`](Self::with_credentials)
+    /// for backends that require a password.
     pub fn new(replicas: Vec<String>, max_size: usize, mode: PoolMode) -> Arc<Self> {
+        Self::with_credentials(replicas, max_size, mode, Arc::new(TrustBackend))
+    }
+
+    /// Like [`new`](Self::new), but authenticates to backends with `credentials`
+    /// (cleartext or SCRAM-SHA-256, over the plaintext backend link).
+    pub fn with_credentials(
+        replicas: Vec<String>,
+        max_size: usize,
+        mode: PoolMode,
+        credentials: Arc<dyn BackendCredentials>,
+    ) -> Arc<Self> {
         assert!(!replicas.is_empty(), "backend pool needs at least one replica");
         let max = max_size.max(1);
         let pool = LruDropPool::try_new(max, max)
@@ -205,7 +353,7 @@ impl BackendPool {
             // `SET`/`PREPARE`/temp-table/`LISTEN` can't leak into the next.
             // `DISCARD ALL` is the safe default (it runs on standbys too).
             reset_query: Some(codec::frame(codec::QUERY, b"DISCARD ALL\0")),
-            connector: PooledConnector::new(PgConnector, pool, RequestKey),
+            connector: PooledConnector::new(PgConnector { credentials }, pool, RequestKey),
         })
     }
 

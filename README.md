@@ -198,6 +198,22 @@ A backend is returned to the pool only at a verified idle boundary, and reset
 with `DISCARD ALL` first (transaction/statement modes), so session state can't
 leak between clients.
 
+`BackendPool::new` assumes trust backends. For backends that require a password,
+use `with_credentials` and a `BackendCredentials` provider — the pool then
+satisfies a cleartext or SCRAM-SHA-256 challenge over its backend link:
+
+```rust
+use rama_pg::pool::{BackendPool, PoolMode, StaticBackendCredentials};
+
+let creds = std::sync::Arc::new(StaticBackendCredentials::new().with_password("alice", "secret"));
+let pool = BackendPool::with_credentials(
+    vec!["127.0.0.1:5433".to_owned()],
+    8,
+    PoolMode::Transaction,
+    creds,
+);
+```
+
 ### Answer queries in-proxy with no backend
 
 Implement `QueryHandler` for a "virtual Postgres" — the proxy answers queries
@@ -343,8 +359,12 @@ where
 ### Pooling (`rama_pg::pool`)
 
 - **`BackendPool`** — `new(replicas, max_size, mode)` builds a pool (on rama's
-  client pool) that round-robins transactions across replicas. A backend returns
+  client pool) that round-robins transactions across replicas; `with_credentials`
+  adds a `BackendCredentials` provider for non-trust backends. A backend returns
   only at a verified `ReadyForQuery` idle, reset with `DISCARD ALL` first.
+- **`BackendCredentials`** — supplies the password the pool uses to authenticate
+  to a backend (cleartext / SCRAM-SHA-256); `StaticBackendCredentials` (in-memory
+  `user → password`) and `TrustBackend` (no auth) are provided.
 - **`PoolMode`** — when a backend is returned:
   - *session* — one backend per client connection, held for the whole session.
   - *transaction* — a backend per transaction, returned at idle (default).
@@ -442,6 +462,7 @@ host *name* plus `hostaddr` (libpq omits SNI for IP literals):
 | `RAMA_PG_POOL_SIZE`     | max pooled backend connections; enables pooling when set      | — (direct)       |
 | `RAMA_PG_REPLICAS`      | `host:port` replicas, `,`-separated, to round-robin (pooling) | `RAMA_PG_BACKEND`|
 | `RAMA_PG_POOL_MODE`     | `session`, `transaction`, or `statement` (pooling)            | `transaction`    |
+| `RAMA_PG_BACKEND_USERS` | `user:password` pairs (`;`-sep) to auth to non-trust pool backends | — (trust)   |
 | `RAMA_PG_CUSTOM`        | if set, answer queries in-proxy with no backend               | —                |
 
 ```sh
@@ -545,10 +566,12 @@ reinventing it:
   mechanism, just a `PasswordValidator`). SASLprep and SCRAM-SHA-256-PLUS channel
   binding are not done. The `cleartext` mechanism terminates only to a trust
   backend.
-- **Pooling** — non-trust backends and a primary/replica read-write split are
-  future work. Transaction/statement modes reset reused backends with
-  `DISCARD ALL`; session-mode connections are still discarded on close rather
-  than reused (the relay is opaque, so there's no idle boundary to reset at).
+- **Pooling** — backends may be trust or password-authenticated (`with_credentials`
+  + a `BackendCredentials` provider; cleartext / SCRAM-SHA-256, MD5 is not
+  supported). The pool's backend link is plaintext TCP (backend TLS is future
+  work). Transaction/statement modes reset reused backends with `DISCARD ALL`;
+  session-mode connections are still discarded on close rather than reused (the
+  relay is opaque, so there's no idle boundary to reset at).
 - **`CancelRequest` routing** is implemented for **direct and pooled modes** via
   the pluggable `Cancellation` provider: the proxy mints an opaque cancel key,
   captures the backend's, and routes a client's `CancelRequest` upstream — to the

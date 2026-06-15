@@ -20,7 +20,7 @@ mod crypto;
 mod secret;
 
 pub use authid::PgAuthidStore;
-pub use client::reauth_upstream;
+pub use client::{authenticate_password, reauth_upstream};
 pub use crypto::ScramKeys;
 pub use secret::{ScramSecret, ScramSecretStore, SecretLookup, StaticSecretStore};
 

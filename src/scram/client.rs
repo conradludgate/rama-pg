@@ -24,18 +24,47 @@ const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
-/// Drive a SCRAM-SHA-256 client exchange against `backend`, reusing `keys`.
-///
-/// Consumes the backend's `AuthenticationSASL`/`SASLContinue`/`SASLFinal`; on
-/// return the next backend message is `AuthenticationOk`, ready for the proxy's
-/// startup splice.
+/// Drive a SCRAM-SHA-256 client exchange against `backend`, reusing recovered
+/// `keys` (the proxy never holds the password — the client computed its proof
+/// against the backend's own salt). Reads the backend's `AuthenticationSASL`
+/// itself; on return the next backend message is `AuthenticationOk`.
 pub async fn reauth_upstream<B>(backend: &mut B, keys: &ScramKeys) -> Result<(), BoxError>
 where
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // 1. AuthenticationSASL — the backend must offer SCRAM-SHA-256.
     let sasl = read_message(backend).await?;
-    expect_auth(&sasl, AUTH_SASL, "AuthenticationSASL")?;
+    run_scram(backend, &sasl, |_salt, _iterations| *keys).await
+}
+
+/// Authenticate to `backend` with SCRAM-SHA-256 using a plaintext `password`
+/// (for pooled connections, where the proxy holds backend credentials rather
+/// than reusing a client's recovered keys). `sasl` is the already-read
+/// `AuthenticationSASL`; on return the next backend message is `AuthenticationOk`.
+pub async fn authenticate_password<B>(
+    backend: &mut B,
+    sasl: &RawMessage,
+    password: &str,
+) -> Result<(), BoxError>
+where
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    run_scram(backend, sasl, |salt, iterations| {
+        ScramKeys::from_password(password.as_bytes(), salt, iterations)
+    })
+    .await
+}
+
+/// The shared SCRAM-SHA-256 client exchange. `sasl` is the backend's
+/// `AuthenticationSASL` (already read); `derive` turns the server's salt and
+/// iteration count into the keys to prove with (reused keys ignore them, a
+/// password derives from them). Consumes through `AuthenticationSASLFinal`.
+async fn run_scram<B, F>(backend: &mut B, sasl: &RawMessage, derive: F) -> Result<(), BoxError>
+where
+    B: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&[u8], u32) -> ScramKeys,
+{
+    // 1. AuthenticationSASL — the backend must offer SCRAM-SHA-256.
+    expect_auth(sasl, AUTH_SASL, "AuthenticationSASL")?;
     let mechanisms = parse_mechanisms(&sasl.payload()[4..]);
     if !mechanisms.iter().any(|m| m == MECHANISM) {
         return Err(format!("backend did not offer SCRAM-SHA-256 (offered {mechanisms:?})").into());
@@ -51,7 +80,7 @@ where
         .await?;
     backend.flush().await?;
 
-    // 3. AuthenticationSASLContinue — server-first-message.
+    // 3. AuthenticationSASLContinue — server-first-message (nonce, salt, iters).
     let cont = read_message(backend).await?;
     expect_auth(&cont, AUTH_SASL_CONTINUE, "AuthenticationSASLContinue")?;
     let server_first = std::str::from_utf8(&cont.payload()[4..])?.to_owned();
@@ -59,8 +88,15 @@ where
     if !server_nonce.starts_with(&client_nonce) {
         return Err("backend server nonce does not extend client nonce".into());
     }
+    let salt = BASE64_STANDARD
+        .decode(field(&server_first, "s=").ok_or("backend server-first missing s=")?)?;
+    let iterations: u32 = field(&server_first, "i=")
+        .ok_or("backend server-first missing i=")?
+        .parse()
+        .map_err(|_| "backend server-first has a non-numeric i=")?;
+    let keys = derive(&salt, iterations);
 
-    // 4. SASLResponse with our client-final-message, proof from the reused keys.
+    // 4. SASLResponse with our client-final-message and proof.
     let channel_binding = BASE64_STANDARD.encode("n,,");
     let without_proof = format!("c={channel_binding},r={server_nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
