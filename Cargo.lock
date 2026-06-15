@@ -1152,6 +1152,7 @@ name = "pgbouncer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "rama",
  "rama-pg",
  "tokio",
@@ -1547,18 +1548,6 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "rama-pg-example"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "rama",
- "rama-pg",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
