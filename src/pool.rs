@@ -22,13 +22,13 @@
 //! replica list.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use rama::Service;
 use rama::error::BoxError;
@@ -220,25 +220,19 @@ fn auth_subtype(msg: &codec::RawMessage) -> i32 {
 /// Supplies the password the pool uses to authenticate to a backend as a role.
 /// The pool connects to backends over plaintext TCP and may be challenged for a
 /// cleartext or SCRAM-SHA-256 password; returning `None` means a trust backend.
+#[async_trait]
 pub trait BackendCredentials: Send + Sync + 'static {
-    fn password(
-        &self,
-        user: &str,
-        database: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>>;
+    async fn password(&self, user: &str, database: &str) -> Result<Option<String>, BoxError>;
 }
 
 /// A trust backend: no credentials (the backend must not challenge for auth).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrustBackend;
 
+#[async_trait]
 impl BackendCredentials for TrustBackend {
-    fn password(
-        &self,
-        _user: &str,
-        _database: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>> {
-        Box::pin(async { Ok(None) })
+    async fn password(&self, _user: &str, _database: &str) -> Result<Option<String>, BoxError> {
+        Ok(None)
     }
 }
 
@@ -264,14 +258,10 @@ impl StaticBackendCredentials {
     }
 }
 
+#[async_trait]
 impl BackendCredentials for StaticBackendCredentials {
-    fn password(
-        &self,
-        user: &str,
-        _database: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, BoxError>> + Send + '_>> {
-        let password = self.passwords.get(user).cloned();
-        Box::pin(async move { Ok(password) })
+    async fn password(&self, user: &str, _database: &str) -> Result<Option<String>, BoxError> {
+        Ok(self.passwords.get(user).cloned())
     }
 }
 

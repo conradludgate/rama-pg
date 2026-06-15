@@ -5,10 +5,9 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rama::error::BoxError;
 use rama::net::tls::ApplicationProtocol;
 use rama::net::tls::server::SelfSignedData;
@@ -71,23 +70,18 @@ async fn main() -> Result<(), BoxError> {
 /// proving the handler can both answer queries and observe transaction state.
 struct DemoHandler;
 
+#[async_trait]
 impl QueryHandler for DemoHandler {
-    fn handle<'a>(
-        &'a self,
-        ctx: QueryContext<'a>,
-        sql: &'a str,
-    ) -> Pin<Box<dyn Future<Output = QueryResponse> + Send + 'a>> {
-        Box::pin(async move {
-            QueryResponse::Rows {
-                columns: vec!["echo".to_owned(), "user".to_owned(), "txn".to_owned()],
-                rows: vec![vec![
-                    Some(sql.to_owned()),
-                    Some(ctx.user.to_owned()),
-                    Some(format!("{:?}", ctx.state.txn_status())),
-                ]],
-                tag: "SELECT 1".to_owned(),
-            }
-        })
+    async fn handle(&self, ctx: QueryContext<'_>, sql: &str) -> QueryResponse {
+        QueryResponse::Rows {
+            columns: vec!["echo".to_owned(), "user".to_owned(), "txn".to_owned()],
+            rows: vec![vec![
+                Some(sql.to_owned()),
+                Some(ctx.user.to_owned()),
+                Some(format!("{:?}", ctx.state.txn_status())),
+            ]],
+            tag: "SELECT 1".to_owned(),
+        }
     }
 }
 

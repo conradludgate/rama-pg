@@ -14,11 +14,10 @@
 
 mod config;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use rama::Service;
 use rama::error::BoxError;
 use rama::net::tls::ApplicationProtocol;
@@ -186,59 +185,54 @@ struct AdminConsole {
     stats: Arc<Stats>,
 }
 
+#[async_trait]
 impl QueryHandler for AdminConsole {
-    fn handle<'a>(
-        &'a self,
-        _ctx: QueryContext<'a>,
-        sql: &'a str,
-    ) -> Pin<Box<dyn Future<Output = QueryResponse> + Send + 'a>> {
-        Box::pin(async move {
-            let command = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
-            match command.as_str() {
-                "SHOW POOLS" => rows(
-                    &["database", "mode", "max_conn", "cl_active"],
-                    vec![vec![
-                        "*".to_owned(),
-                        format!("{:?}", self.stats.mode).to_lowercase(),
-                        self.stats.max_size.to_string(),
-                        self.stats.active().to_string(),
-                    ]],
-                ),
-                "SHOW CLIENTS" => {
-                    let data = self
-                        .stats
-                        .clients
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|c| vec![c.id.to_string(), c.user.clone(), c.database.clone(), "active".to_owned()])
-                        .collect();
-                    rows(&["client_id", "user", "database", "state"], data)
-                }
-                "SHOW STATS" => rows(
-                    &["total_connections", "active_clients"],
-                    vec![vec![
-                        self.stats.total_connections.load(Ordering::Relaxed).to_string(),
-                        self.stats.active().to_string(),
-                    ]],
-                ),
-                "SHOW LISTS" => rows(
-                    &["list", "items"],
-                    vec![
-                        vec!["replicas".to_owned(), self.stats.replicas.len().to_string()],
-                        vec!["clients".to_owned(), self.stats.active().to_string()],
-                    ],
-                ),
-                "SHOW VERSION" => rows(&["version"], vec![vec!["rama-pg pgbouncer-like 0.1".to_owned()]]),
-                other if other.starts_with("SHOW") => {
-                    QueryResponse::error("0A000", format!("unsupported console command: {other}"))
-                }
-                _ => QueryResponse::error(
-                    "0A000",
-                    "rama-pg console: only SHOW POOLS/CLIENTS/STATS/LISTS/VERSION are supported",
-                ),
+    async fn handle(&self, _ctx: QueryContext<'_>, sql: &str) -> QueryResponse {
+        let command = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        match command.as_str() {
+            "SHOW POOLS" => rows(
+                &["database", "mode", "max_conn", "cl_active"],
+                vec![vec![
+                    "*".to_owned(),
+                    format!("{:?}", self.stats.mode).to_lowercase(),
+                    self.stats.max_size.to_string(),
+                    self.stats.active().to_string(),
+                ]],
+            ),
+            "SHOW CLIENTS" => {
+                let data = self
+                    .stats
+                    .clients
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|c| vec![c.id.to_string(), c.user.clone(), c.database.clone(), "active".to_owned()])
+                    .collect();
+                rows(&["client_id", "user", "database", "state"], data)
             }
-        })
+            "SHOW STATS" => rows(
+                &["total_connections", "active_clients"],
+                vec![vec![
+                    self.stats.total_connections.load(Ordering::Relaxed).to_string(),
+                    self.stats.active().to_string(),
+                ]],
+            ),
+            "SHOW LISTS" => rows(
+                &["list", "items"],
+                vec![
+                    vec!["replicas".to_owned(), self.stats.replicas.len().to_string()],
+                    vec!["clients".to_owned(), self.stats.active().to_string()],
+                ],
+            ),
+            "SHOW VERSION" => rows(&["version"], vec![vec!["rama-pg pgbouncer-like 0.1".to_owned()]]),
+            other if other.starts_with("SHOW") => {
+                QueryResponse::error("0A000", format!("unsupported console command: {other}"))
+            }
+            _ => QueryResponse::error(
+                "0A000",
+                "rama-pg console: only SHOW POOLS/CLIENTS/STATS/LISTS/VERSION are supported",
+            ),
+        }
     }
 }
 

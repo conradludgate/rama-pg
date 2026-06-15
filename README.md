@@ -239,25 +239,19 @@ Implement `QueryHandler` for a "virtual Postgres" — the proxy answers queries
 itself, with access to per-connection transaction state:
 
 ```rust
-use std::future::Future;
-use std::pin::Pin;
+use async_trait::async_trait;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 
 struct Echo;
 
+#[async_trait]
 impl QueryHandler for Echo {
-    fn handle<'a>(
-        &'a self,
-        ctx: QueryContext<'a>,
-        sql: &'a str,
-    ) -> Pin<Box<dyn Future<Output = QueryResponse> + Send + 'a>> {
-        Box::pin(async move {
-            QueryResponse::Rows {
-                columns: vec!["echo".to_owned(), "user".to_owned()],
-                rows: vec![vec![Some(sql.to_owned()), Some(ctx.user.to_owned())]],
-                tag: "SELECT 1".to_owned(),
-            }
-        })
+    async fn handle(&self, ctx: QueryContext<'_>, sql: &str) -> QueryResponse {
+        QueryResponse::Rows {
+            columns: vec!["echo".to_owned(), "user".to_owned()],
+            rows: vec![vec![Some(sql.to_owned()), Some(ctx.user.to_owned())]],
+            tag: "SELECT 1".to_owned(),
+        }
     }
 }
 // PgProxy::new(tls, router, auth, None, Some(Arc::new(Echo)), cancellation);
@@ -274,30 +268,27 @@ lease-acquire (once for a direct 1:1 backend, per-transaction when pooling),
 `clear` when idle. Implement the trait to use a different (e.g. distributed) store:
 
 ```rust
+use async_trait::async_trait;
 use bytes::Bytes;
 use rama::error::BoxError;
 use rama_pg::cancel::{CancelHandle, Cancellation};
 
-type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
 struct MyCancellation { /* a shared/distributed map of key -> CancelSlot */ }
 
+#[async_trait]
 impl Cancellation for MyCancellation {
-    fn begin(&self) -> Fut<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
-        Box::pin(async move {
-            // Mint a key, make a CancelSlot, store a clone under the key, and
-            // return CancelHandle::new(slot, move || /* deregister the key */).
-            // (Or (None, CancelHandle::disabled()) to pass the backend's through.)
-            todo!()
-        })
+    async fn begin(&self, protocol_version: i32) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
+        // Mint a key (size it to `protocol_version` — 3.2 allows longer), make a
+        // CancelSlot, store a clone under the key, and return
+        // CancelHandle::new(slot, move || /* deregister the key */).
+        // (Or (None, CancelHandle::disabled()) to pass the backend's key through.)
+        todo!()
     }
 
-    fn cancel(&self, key: Bytes) -> Fut<'_, Result<(), BoxError>> {
-        Box::pin(async move {
-            // Look `key` up, read its slot's current UpstreamSession (if any),
-            // and deliver a CancelRequest to that backend.
-            todo!()
-        })
+    async fn cancel(&self, key: Bytes) -> Result<(), BoxError> {
+        // Look `key` up, read its slot's current UpstreamSession (if any), and
+        // deliver a CancelRequest to that backend.
+        todo!()
     }
 }
 ```

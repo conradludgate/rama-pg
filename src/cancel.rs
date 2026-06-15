@@ -30,20 +30,15 @@
 //! longer key both work without change (3.2 negotiation is not implemented yet).
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use rama::error::BoxError;
 use rama::tcp::TokioTcpStream;
 use tokio::io::AsyncWriteExt;
 
 use crate::protocol::startup::{cancel_request_frame, protocol_minor};
-
-/// A boxed future, so [`Cancellation`] is dyn-safe (it is shared as a trait
-/// object across the proxy's startup, forwarding, and cancel paths).
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The backend a client is currently using: where it is, and the key it issued.
 #[derive(Debug, Clone)]
@@ -118,6 +113,7 @@ impl std::fmt::Debug for CancelHandle {
 }
 
 /// Pluggable query-cancellation handling (see the module docs).
+#[async_trait]
 pub trait Cancellation: Send + Sync + 'static {
     /// Begin a client cancel session for a client on `protocol_version` (so the
     /// key can be sized to it — protocol 3.2 allows longer, harder-to-guess
@@ -125,13 +121,15 @@ pub trait Cancellation: Send + Sync + 'static {
     /// `None` to pass the backend's own key through, disabling mediation for this
     /// session) and a [`CancelHandle`] the forwarder uses to track the client's
     /// current backend.
-    fn begin(&self, protocol_version: i32)
-        -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>>;
+    async fn begin(
+        &self,
+        protocol_version: i32,
+    ) -> Result<(Option<Bytes>, CancelHandle), BoxError>;
 
     /// Act on a client's `CancelRequest`: `key` is the payload it presented
     /// (matching a prior [`begin`](Self::begin)). Best-effort — an unknown key, an
     /// idle session, or a delivery failure is generally logged, not surfaced.
-    fn cancel(&self, key: Bytes) -> BoxFuture<'_, Result<(), BoxError>>;
+    async fn cancel(&self, key: Bytes) -> Result<(), BoxError>;
 }
 
 /// Default [`Cancellation`]: an in-memory registry mapping opaque proxy-issued
@@ -156,49 +154,46 @@ impl RegistryCancellation {
     }
 }
 
+#[async_trait]
 impl Cancellation for RegistryCancellation {
-    fn begin(
+    async fn begin(
         &self,
         protocol_version: i32,
-    ) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
-        Box::pin(async move {
-            // A fresh opaque, random key the client only echoes back (so the proxy
-            // never exposes the backend's real key). Protocol 3.0 expects the
-            // classic 8-byte `BackendKeyData` payload (pid + 4-byte secret); 3.2+
-            // allows a longer, harder-to-brute-force key.
-            let len = if protocol_minor(protocol_version) >= 2 { 32 } else { 8 };
-            let mut bytes = vec![0u8; len];
-            rand::fill(&mut bytes[..]);
-            let key = Bytes::copy_from_slice(&bytes);
+    ) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
+        // A fresh opaque, random key the client only echoes back (so the proxy
+        // never exposes the backend's real key). Protocol 3.0 expects the classic
+        // 8-byte `BackendKeyData` payload (pid + 4-byte secret); 3.2+ allows a
+        // longer, harder-to-brute-force key.
+        let len = if protocol_minor(protocol_version) >= 2 { 32 } else { 8 };
+        let mut bytes = vec![0u8; len];
+        rand::fill(&mut bytes[..]);
+        let key = Bytes::copy_from_slice(&bytes);
 
-            let slot: CancelSlot = Arc::new(Mutex::new(None));
-            self.sessions.lock().unwrap().insert(key.clone(), slot.clone());
+        let slot: CancelSlot = Arc::new(Mutex::new(None));
+        self.sessions.lock().unwrap().insert(key.clone(), slot.clone());
 
-            let sessions = self.sessions.clone();
-            let registered = key.clone();
-            let handle = CancelHandle::new(slot, move || {
-                sessions.lock().unwrap().remove(&registered);
-            });
-            Ok((Some(key), handle))
-        })
+        let sessions = self.sessions.clone();
+        let registered = key.clone();
+        let handle = CancelHandle::new(slot, move || {
+            sessions.lock().unwrap().remove(&registered);
+        });
+        Ok((Some(key), handle))
     }
 
-    fn cancel(&self, key: Bytes) -> BoxFuture<'_, Result<(), BoxError>> {
-        Box::pin(async move {
-            let slot = self.sessions.lock().unwrap().get(&key).cloned();
-            let target = slot.and_then(|slot| slot.lock().unwrap().clone());
-            let Some(session) = target else {
-                tracing::debug!("cancel request for an unknown or idle key; ignoring");
-                return Ok(());
-            };
-            // Open a fresh connection to the backend and deliver its own cancel
-            // key. Postgres acts on it and closes the socket; we don't await a reply.
-            let mut conn = TokioTcpStream::connect(&session.backend).await?;
-            conn.write_all(&cancel_request_frame(&session.key)).await?;
-            conn.flush().await?;
-            tracing::info!(backend = %session.backend, "forwarded cancel request upstream");
-            Ok(())
-        })
+    async fn cancel(&self, key: Bytes) -> Result<(), BoxError> {
+        let slot = self.sessions.lock().unwrap().get(&key).cloned();
+        let target = slot.and_then(|slot| slot.lock().unwrap().clone());
+        let Some(session) = target else {
+            tracing::debug!("cancel request for an unknown or idle key; ignoring");
+            return Ok(());
+        };
+        // Open a fresh connection to the backend and deliver its own cancel key.
+        // Postgres acts on it and closes the socket; we don't await a reply.
+        let mut conn = TokioTcpStream::connect(&session.backend).await?;
+        conn.write_all(&cancel_request_frame(&session.key)).await?;
+        conn.flush().await?;
+        tracing::info!(backend = %session.backend, "forwarded cancel request upstream");
+        Ok(())
     }
 }
 
@@ -208,16 +203,17 @@ impl Cancellation for RegistryCancellation {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoCancellation;
 
+#[async_trait]
 impl Cancellation for NoCancellation {
-    fn begin(
+    async fn begin(
         &self,
         _protocol_version: i32,
-    ) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
-        Box::pin(async { Ok((None, CancelHandle::disabled())) })
+    ) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
+        Ok((None, CancelHandle::disabled()))
     }
 
-    fn cancel(&self, _key: Bytes) -> BoxFuture<'_, Result<(), BoxError>> {
-        Box::pin(async { Ok(()) })
+    async fn cancel(&self, _key: Bytes) -> Result<(), BoxError> {
+        Ok(())
     }
 }
 

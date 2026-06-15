@@ -4,12 +4,12 @@
 //! A [`QueryHandler`] is given the SQL and a [`QueryContext`] (including the
 //! per-connection [`SessionState`]) and returns a [`QueryResponse`]; the session
 //! ([`crate::proxy`]) owns the wire encoding and the transaction-status state
-//! machine. The handler trait is boxed-future rather than RPITIT so it can be
-//! used as `dyn QueryHandler` for runtime mode selection.
+//! machine. The handler trait uses `#[async_trait]` (rather than RPITIT) so it
+//! can be used as `dyn QueryHandler` for runtime mode selection.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
+
+use async_trait::async_trait;
 
 /// Transaction status, reported in every `ReadyForQuery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,10 +98,7 @@ impl QueryResponse {
 }
 
 /// A pluggable, async handler that answers simple-protocol queries in-proxy.
+#[async_trait]
 pub trait QueryHandler: Send + Sync + 'static {
-    fn handle<'a>(
-        &'a self,
-        ctx: QueryContext<'a>,
-        sql: &'a str,
-    ) -> Pin<Box<dyn Future<Output = QueryResponse> + Send + 'a>>;
+    async fn handle(&self, ctx: QueryContext<'_>, sql: &str) -> QueryResponse;
 }
