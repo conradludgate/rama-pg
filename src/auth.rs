@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::protocol::codec::{self, read_message_capped};
 use crate::protocol::message;
 use crate::protocol::startup::StartupMessage;
-use crate::scram::{ScramKeys, ScramSecretStore, ScramSha256, StaticSecretStore};
+use crate::scram::ScramKeys;
 
 /// Connection facts an [`Authenticator`] may key on: the parsed startup
 /// parameters and the TLS SNI.
@@ -194,41 +194,6 @@ fn password_bytes(payload: &[u8]) -> &[u8] {
     match payload.iter().position(|&b| b == 0) {
         Some(nul) => &payload[..nul],
         None => payload,
-    }
-}
-
-/// A runtime-selected authenticator, dispatching to a concrete mechanism.
-/// Generic over the cleartext validator `V` and the SCRAM secret store `S`,
-/// both defaulting to the in-memory implementations.
-#[derive(Debug, Clone)]
-pub enum Auth<V = StaticPasswordValidator, S = StaticSecretStore> {
-    PassThrough(PassThrough),
-    Cleartext(CleartextPassword<V>),
-    Scram(ScramSha256<S>),
-}
-
-impl<V: PasswordValidator, S: ScramSecretStore> Authenticator for Auth<V, S> {
-    async fn authenticate<IO>(
-        &self,
-        client: &mut IO,
-        ctx: &AuthContext<'_>,
-    ) -> Result<ClientAuth, BoxError>
-    where
-        IO: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        match self {
-            Auth::PassThrough(a) => a.authenticate(client, ctx).await,
-            Auth::Cleartext(a) => a.authenticate(client, ctx).await,
-            Auth::Scram(a) => a.authenticate(client, ctx).await,
-        }
-    }
-
-    fn terminates(&self) -> bool {
-        match self {
-            Auth::PassThrough(a) => a.terminates(),
-            Auth::Cleartext(a) => a.terminates(),
-            Auth::Scram(a) => a.terminates(),
-        }
     }
 }
 
