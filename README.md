@@ -220,25 +220,28 @@ let pool = BackendPool::with_credentials(
 ### Answer queries in-proxy with no backend
 
 Implement `QueryHandler` for a "virtual Postgres" — the proxy answers queries
-itself, with access to per-connection transaction state:
+itself, with access to per-connection transaction state. There's no backend to
+interrupt, so a `CancelRequest` fires `ctx.cancel` (a `CancellationToken`); a
+long-running handler races it and returns a `57014` error to cancel cooperatively:
 
 ```rust
 use async_trait::async_trait;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 
-struct Echo;
+struct SlowEcho;
 
 #[async_trait]
-impl QueryHandler for Echo {
+impl QueryHandler for SlowEcho {
     async fn handle(&self, ctx: QueryContext<'_>, sql: &str) -> QueryResponse {
-        QueryResponse::Rows {
-            columns: vec!["echo".to_owned(), "user".to_owned()],
-            rows: vec![vec![Some(sql.to_owned()), Some(ctx.user.to_owned())]],
-            tag: "SELECT 1".to_owned(),
+        tokio::select! {
+            _ = expensive_work() => QueryResponse::scalar("echo", sql),
+            _ = ctx.cancel.cancelled() => {
+                QueryResponse::error("57014", "canceling statement due to user request")
+            }
         }
     }
 }
-// PgProxy::new(tls, router, auth, None, Some(Arc::new(Echo)), cancellation);
+// PgProxy::new(tls, router, auth, None, Some(Arc::new(SlowEcho)), cancellation);
 ```
 
 ### Mediate query cancellation
@@ -253,25 +256,24 @@ lease-acquire (once for a direct 1:1 backend, per-transaction when pooling),
 
 ```rust
 use async_trait::async_trait;
-use bytes::Bytes;
 use rama::error::BoxError;
 use rama_pg::cancel::{CancelHandle, Cancellation};
+use rama_pg::protocol::startup::{CancelKey, ProtocolVersion};
 
-struct MyCancellation { /* a shared/distributed map of key -> CancelSlot */ }
+struct MyCancellation { /* a shared/distributed key -> CancelSlot map */ }
 
 #[async_trait]
 impl Cancellation for MyCancellation {
-    async fn begin(&self, protocol_version: i32) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
-        // Mint a key (size it to `protocol_version` — 3.2 allows longer), make a
-        // CancelSlot, store a clone under the key, and return
-        // CancelHandle::new(slot, move || /* deregister the key */).
-        // (Or (None, CancelHandle::disabled()) to pass the backend's key through.)
+    async fn begin(&self, version: ProtocolVersion) -> Result<(Option<CancelKey>, CancelHandle), BoxError> {
+        // Mint a key (size it to `version` — 3.2 allows longer), make a CancelSlot,
+        // store a clone under the key, and return CancelHandle::new(slot, move ||
+        // /* deregister */). (Or (None, CancelHandle::disabled()) for no mediation.)
         todo!()
     }
 
-    async fn cancel(&self, key: Bytes) -> Result<(), BoxError> {
-        // Look `key` up, read its slot's current UpstreamSession (if any), and
-        // deliver a CancelRequest to that backend.
+    async fn cancel(&self, key: CancelKey) -> Result<(), BoxError> {
+        // Look `key` up and invoke its current `CancelTarget` (if any) — e.g.
+        // `UpstreamCancel` dials the backend, `TokenCancel` fires a query's token.
         todo!()
     }
 }
@@ -373,18 +375,23 @@ where
 
 - **`Cancellation`** — the pluggable seam: `begin` (assign the client's cancel key
   + return a `CancelHandle`) and `cancel` (route an incoming `CancelRequest`).
-- **`CancelHandle`** — the forwarder reports the client's current backend through
-  it: `set`/`clear`, and it deregisters the key on drop. `CancelSlot` is the
-  shared cell behind it; `UpstreamSession` is a backend address + its key.
-- **`RegistryCancellation`** — default in-memory store: opaque random keys,
-  delivering an upstream `CancelRequest` to the client's current backend. Works
-  for both direct and pooled connections.
+- **`CancelTarget`** — the trait for *what a cancel does*: `cancel(&self)`.
+  Built-ins are **`UpstreamCancel`** (dial a backend + forward a `CancelRequest`)
+  and **`TokenCancel`** (fire a `CancellationToken`, for in-proxy queries);
+  implement it for a new mechanism.
+- **`CancelHandle`** — the forwarder reports the client's current target through
+  it (`set(Arc<dyn CancelTarget>)` / `clear`, deregisters the key on drop);
+  `CancelSlot` is the shared cell behind it.
+- **`RegistryCancellation`** — default in-memory store: opaque random keys; on
+  cancel it invokes the registered target. Works for direct, pooled, *and*
+  in-proxy custom connections.
 - **`NoCancellation`** — disables mediation (client sees the backend's own key).
 
 ### Custom queries (`rama_pg::query`)
 
 - **`QueryHandler`** — answer simple `Query`s in-proxy; **`QueryContext`** carries
-  the user and per-connection **`SessionState`** (transaction status);
+  the user, per-connection **`SessionState`** (transaction status), and a
+  `cancel` `CancellationToken` (fires on the client's `CancelRequest`);
   **`QueryResponse`** is `Rows` / `Command` / `Error`.
 
 ### Routing (`rama_pg::route`)
@@ -543,13 +550,14 @@ reinventing it:
   work). Transaction/statement modes reset reused backends with `DISCARD ALL`;
   session-mode connections are still discarded on close rather than reused (the
   relay is opaque, so there's no idle boundary to reset at).
-- **`CancelRequest` routing** is implemented for **direct and pooled modes** via
-  the pluggable `Cancellation` provider: the proxy mints an opaque cancel key,
-  captures the backend's, and routes a client's `CancelRequest` upstream — to the
-  backend it is currently using (tracked per-transaction when pooling), over
-  either the plaintext or the over-TLS cancel path. Protocol versions are
-  negotiated (3.0 and 3.2): a synthesized-mode client on 3.2 gets a longer,
-  harder-to-guess cancel key; direct modes issue the classic 4-byte key.
+- **`CancelRequest` routing** is implemented for **all modes** via the pluggable
+  `Cancellation` provider: the proxy mints an opaque cancel key and, on a cancel,
+  either forwards a `CancelRequest` to the backend the client is currently using
+  (direct, or per-transaction when pooling) or fires a `CancellationToken` for an
+  in-proxy custom query — over either the plaintext or the over-TLS cancel path.
+  Protocol versions are negotiated (3.0 and 3.2): a synthesized-mode client on
+  3.2 gets a longer, harder-to-guess cancel key; direct modes issue the classic
+  4-byte key.
 
 ## License
 
