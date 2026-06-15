@@ -25,12 +25,12 @@ use rama::net::tls::ApplicationProtocol;
 use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
-use rama::tls::rustls::server::TlsAcceptorDataBuilder;
+use rama::tls::rustls::server::{TlsAcceptorDataBuilder, self_signed_server_auth};
 use rama_pg::cancel::RegistryCancellation;
 use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::{CustomForwarder, PgClient, PgProxy, PooledForwarder};
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
-use rama_pg::scram::{PgAuthidStore, ScramSha256};
+use rama_pg::scram::{PgAuthidStore, ScramSha256, tls_server_end_point};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing_subscriber::EnvFilter;
 
@@ -51,17 +51,24 @@ async fn main() -> Result<(), BoxError> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = Config::from_ini(&text)?;
 
-    // The `postgresql` ALPN lets direct-TLS (`sslnegotiation=direct`) clients connect.
-    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?
+    // Build the cert explicitly so we can derive the `tls-server-end-point`
+    // channel binding (SCRAM-SHA-256-PLUS) from the leaf. The `postgresql` ALPN
+    // lets direct-TLS (`sslnegotiation=direct`) clients connect.
+    let (cert_chain, key) = self_signed_server_auth(SelfSignedData::default())?;
+    let channel_binding = tls_server_end_point(&cert_chain[0]);
+    let tls = TlsAcceptorDataBuilder::new(cert_chain, key)?
         .with_alpn_protocols(&[ApplicationProtocol::PostgreSQL])
         .build();
 
-    // SCRAM auth, verifier fetched from pg_authid over an admin connection.
-    let auth = Arc::new(ScramSha256::new(PgAuthidStore::new(
-        config.backend.clone(),
-        config.auth_user.clone(),
-        config.auth_dbname.clone(),
-    )));
+    // SCRAM auth (with -PLUS), verifier fetched from pg_authid over an admin connection.
+    let auth = Arc::new(
+        ScramSha256::new(PgAuthidStore::new(
+            config.backend.clone(),
+            config.auth_user.clone(),
+            config.auth_dbname.clone(),
+        ))
+        .with_channel_binding(channel_binding),
+    );
 
     let stats = Arc::new(Stats::new(
         config.pool_mode,

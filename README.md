@@ -12,7 +12,7 @@ onto a non-HTTP protocol.
 > exploration, useful for understanding the Postgres wire protocol and rama's
 > service model — not for fronting a real database. It authenticates clients but
 > takes deliberate shortcuts (no SASLprep, a trust-only `pg_authid` admin
-> connection, no channel binding, no `CancelRequest` routing) and builds against
+> connection) and builds against
 > an unreleased git revision of rama. Don't put it in front of data you care
 > about.
 
@@ -157,6 +157,25 @@ let store = StaticSecretStore::new()
     .with_secret("alice", ScramSecret::parse("SCRAM-SHA-256$4096:<salt>$<stored>:<server>")?);
 let auth = Arc::new(Auth::Scram(ScramSha256::new(store)));
 ```
+
+To also offer **SCRAM-SHA-256-PLUS** (channel binding), derive the
+`tls-server-end-point` data from the proxy's leaf certificate and pass it in.
+Build the cert explicitly (rather than `try_new_self_signed`) so you can hash it:
+
+```rust
+use rama::net::tls::server::SelfSignedData;
+use rama::tls::rustls::server::{TlsAcceptorDataBuilder, self_signed_server_auth};
+use rama_pg::scram::{ScramSha256, tls_server_end_point};
+
+let (cert_chain, key) = self_signed_server_auth(SelfSignedData::default())?;
+let channel_binding = tls_server_end_point(&cert_chain[0]); // leaf cert (SHA-256)
+let tls = TlsAcceptorDataBuilder::new(cert_chain, key)?.build();
+
+let auth = Arc::new(Auth::Scram(ScramSha256::new(store).with_channel_binding(channel_binding)));
+```
+
+The proxy then advertises both mechanisms, verifies the client bound to its
+certificate, and rejects a `y`-flag downgrade (a stripped `-PLUS`).
 
 ### Supply SCRAM verifiers from your own source
 
@@ -350,7 +369,10 @@ where
 
 ### SCRAM (`rama_pg::scram`)
 
-- **`ScramSha256<S>`** — the SCRAM server authenticator over a `ScramSecretStore`.
+- **`ScramSha256<S>`** — the SCRAM server authenticator over a `ScramSecretStore`;
+  `with_channel_binding(data)` also offers SCRAM-SHA-256-PLUS.
+- **`tls_server_end_point(cert_der)`** — the `tls-server-end-point` channel-binding
+  data (SHA-256 of the leaf cert) to pass to `with_channel_binding`.
 - **`ScramSecretStore`** — async verifier source; `StaticSecretStore` (in-memory)
   and `PgAuthidStore` (`pg_authid` over an admin connection) are provided.
 - **`ScramSecret` / `ScramKeys`** — a parsed verifier and the recovered key
@@ -414,7 +436,8 @@ where
   connects to a trust backend.
 - **scram** — the proxy runs SCRAM-SHA-256 as the server using a verifier from a
   `ScramSecretStore`, then reauthenticates to a SCRAM backend reusing the
-  recovered `ClientKey`.
+  recovered `ClientKey`. With `with_channel_binding` it also offers
+  SCRAM-SHA-256-PLUS bound to the proxy's TLS certificate.
 
 ### Crate layout
 
@@ -563,9 +586,10 @@ reinventing it:
   None, .. }`) and the builder only offers `with_no_client_auth()`, so the proxy
   never sees a cert. A clean fix is small and upstream; deferred pending that.
 - **Auth** — `OAUTHBEARER` is not implemented (JWT-over-cleartext needs no new
-  mechanism, just a `PasswordValidator`). SASLprep and SCRAM-SHA-256-PLUS channel
-  binding are not done. The `cleartext` mechanism terminates only to a trust
-  backend.
+  mechanism, just a `PasswordValidator`). SCRAM-SHA-256-PLUS channel binding
+  (`tls-server-end-point`) *is* offered when configured with the proxy's cert
+  binding (it assumes a SHA-256-signed cert; SASLprep is still not done). The
+  `cleartext` mechanism terminates only to a trust backend.
 - **Pooling** — backends may be trust or password-authenticated (`with_credentials`
   + a `BackendCredentials` provider; cleartext / SCRAM-SHA-256, MD5 is not
   supported). The pool's backend link is plaintext TCP (backend TLS is future

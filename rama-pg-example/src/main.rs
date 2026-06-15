@@ -14,14 +14,14 @@ use rama::net::tls::ApplicationProtocol;
 use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
-use rama::tls::rustls::server::TlsAcceptorDataBuilder;
+use rama::tls::rustls::server::{TlsAcceptorDataBuilder, self_signed_server_auth};
 use rama_pg::auth::{Auth, CleartextPassword, PassThrough, StaticPasswordValidator};
 use rama_pg::cancel::RegistryCancellation;
 use rama_pg::pool::{BackendCredentials, BackendPool, PoolMode, StaticBackendCredentials};
 use rama_pg::proxy::PgProxy;
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
 use rama_pg::route::{Backend, Router};
-use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
+use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore, tls_server_end_point};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -32,9 +32,13 @@ async fn main() -> Result<(), BoxError> {
         )
         .init();
 
-    // Self-signed cert for now; real SNI-matched certs arrive with routing. The
-    // `postgresql` ALPN is required for direct-TLS (`sslnegotiation=direct`) clients.
-    let tls = TlsAcceptorDataBuilder::try_new_self_signed(SelfSignedData::default())?
+    // Self-signed cert for now; real SNI-matched certs arrive with routing. We
+    // build it explicitly so we can derive the `tls-server-end-point` channel
+    // binding from the leaf cert (for SCRAM-SHA-256-PLUS). The `postgresql` ALPN
+    // is required for direct-TLS (`sslnegotiation=direct`) clients.
+    let (cert_chain, key) = self_signed_server_auth(SelfSignedData::default())?;
+    let channel_binding = tls_server_end_point(&cert_chain[0]);
+    let tls = TlsAcceptorDataBuilder::new(cert_chain, key)?
         .with_alpn_protocols(&[ApplicationProtocol::PostgreSQL])
         .build();
 
@@ -43,7 +47,7 @@ async fn main() -> Result<(), BoxError> {
         tracing::warn!("no routes configured; set RAMA_PG_BACKEND and/or RAMA_PG_ROUTES");
     }
 
-    let auth = Arc::new(build_auth());
+    let auth = Arc::new(build_auth(channel_binding));
     let pool = build_pool();
     let handler = build_handler();
     // In-memory cancellation registry: the proxy mints an opaque cancel key per
@@ -182,7 +186,7 @@ fn build_router() -> Router {
 /// - `RAMA_PG_USERS` — `user:password` pairs separated by `;` (cleartext mode).
 /// - `RAMA_PG_SCRAM_SECRETS` — `user=SCRAM-SHA-256$...` verifiers separated by
 ///   `;` (scram mode; copy from Postgres `pg_authid.rolpassword`).
-fn build_auth() -> Auth {
+fn build_auth(channel_binding: Vec<u8>) -> Auth {
     match env::var("RAMA_PG_AUTH").as_deref() {
         Ok("cleartext") => {
             let credentials = parse_users();
@@ -191,8 +195,9 @@ fn build_auth() -> Auth {
         }
         Ok("scram") => {
             let store = build_scram_store();
-            tracing::info!("auth mode: scram-sha-256 (terminate + upstream reauth)");
-            Auth::Scram(ScramSha256::new(store))
+            tracing::info!("auth mode: scram-sha-256 (terminate + upstream reauth, with -PLUS)");
+            // Offer SCRAM-SHA-256-PLUS bound to the proxy's TLS certificate.
+            Auth::Scram(ScramSha256::new(store).with_channel_binding(channel_binding))
         }
         _ => {
             tracing::info!("auth mode: pass-through");
