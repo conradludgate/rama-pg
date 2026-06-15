@@ -12,6 +12,7 @@ base64 = "0.22"
 subtle = "2"
 rand = "0.10"
 async-trait = "0.1"
+tokio-util = "0.7"
 rama-pg = { path = "." }
 
 [package]
@@ -31,3 +32,4 @@ base64 = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
+tokio-util = { workspace = true }

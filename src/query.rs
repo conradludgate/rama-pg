@@ -10,6 +10,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// Transaction status, reported in every `ReadyForQuery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,6 +62,11 @@ pub struct QueryContext<'a> {
     pub user: &'a str,
     pub database: &'a str,
     pub state: &'a SessionState,
+    /// Fires when the client sends a `CancelRequest` for this query. A
+    /// long-running handler should race it (e.g. `tokio::select!` on
+    /// `ctx.cancel.cancelled()`) and return a `57014` error to cancel
+    /// cooperatively; there is no backend to interrupt.
+    pub cancel: &'a CancellationToken,
 }
 
 /// A handler's response to one simple query.

@@ -38,7 +38,7 @@ use rama::net::client::pool::{ConnID, LeasedConnection, LruDropPool, PooledConne
 use rama::tcp::{TcpStream, TokioTcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::cancel::UpstreamSession;
+use crate::cancel::UpstreamCancel;
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::startup::CancelKey;
 
@@ -68,7 +68,7 @@ impl Extension for CapturedParams {}
 /// the connection so the pooled forwarder can route a client's cancel to whatever
 /// backend it is currently leasing.
 #[derive(Debug, Clone)]
-struct CapturedCancel(UpstreamSession);
+struct CapturedCancel(UpstreamCancel);
 
 impl Extension for CapturedCancel {}
 
@@ -201,7 +201,7 @@ impl Service<BackendRequest> for PgConnector {
         let conn = TcpStream::new(conn);
         conn.extensions().insert(CapturedParams(params));
         if let Some(key) = cancel_key {
-            conn.extensions().insert(CapturedCancel(UpstreamSession {
+            conn.extensions().insert(CapturedCancel(UpstreamCancel {
                 backend: req.target.clone(),
                 key,
             }));
@@ -437,7 +437,7 @@ impl Lease {
     /// The backend's cancel target (address + captured `BackendKeyData`), so the
     /// forwarder can route a client's `CancelRequest` to this backend while the
     /// lease is held. `None` if the backend issued no key.
-    pub fn cancel_target(&self) -> Option<UpstreamSession> {
+    pub fn cancel_target(&self) -> Option<UpstreamCancel> {
         self.conn
             .extensions()
             .get_ref::<CapturedCancel>()

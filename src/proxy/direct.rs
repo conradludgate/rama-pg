@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject};
 use crate::auth::{BackendAuth, ClientAuth};
-use crate::cancel::{CancelHandle, Cancellation, UpstreamSession};
+use crate::cancel::{CancelHandle, Cancellation, UpstreamCancel};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
 use crate::protocol::startup::{CancelKey, ProtocolVersion};
@@ -171,10 +171,10 @@ where
                 // cancellation issued none).
                 match client_key {
                     Some(key) => {
-                        handle.set(UpstreamSession {
+                        handle.set(Arc::new(UpstreamCancel {
                             backend: backend_addr.to_owned(),
                             key: CancelKey::from_bytes(Bytes::copy_from_slice(msg.payload())),
-                        });
+                        }));
                         client.write_all(&message::backend_key_data_raw(key.as_bytes())).await?;
                     }
                     None => client.write_all(msg.as_bytes()).await?,

@@ -94,7 +94,7 @@ impl<A: Authenticator> PgProxy<A> {
         cancellation: Arc<dyn Cancellation>,
     ) -> Self {
         let forwarder = if let Some(handler) = handler {
-            CustomForwarder::new(handler).boxed()
+            CustomForwarder::new(handler, cancellation.clone()).boxed()
         } else if let Some(pool) = pool {
             PooledForwarder::new(pool, cancellation.clone()).boxed()
         } else {

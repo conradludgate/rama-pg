@@ -1547,6 +1547,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

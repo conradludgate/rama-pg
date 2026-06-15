@@ -82,7 +82,7 @@ async fn main() -> Result<(), BoxError> {
     // an incoming CancelRequest to it).
     let cancellation = Arc::new(RegistryCancellation::new());
     let forwarder = PgBouncerForwarder {
-        admin: CustomForwarder::new(Arc::new(AdminConsole { stats: stats.clone() })),
+        admin: CustomForwarder::new(Arc::new(AdminConsole { stats: stats.clone() }), cancellation.clone()),
         pool: PooledForwarder::new(
             BackendPool::new(vec![config.backend.clone()], config.pool_size, config.pool_mode),
             cancellation.clone(),

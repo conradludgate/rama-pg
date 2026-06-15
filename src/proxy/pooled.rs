@@ -110,7 +110,7 @@ where
             let mut lease = pool.lease(startup_frame, user, database).await?;
             // Point cancellation at this backend for the life of the session.
             if let Some(target) = lease.cancel_target() {
-                handle.set(target);
+                handle.set(Arc::new(target));
             }
             let outcome = copy_bidirectional(&mut stream, &mut lease).await;
             handle.clear();
@@ -158,7 +158,7 @@ where
         // Route cancellation at this backend while the client holds the lease;
         // clear it once the transaction is done (the client is idle again).
         if let Some(target) = lease.cancel_target() {
-            handle.set(target);
+            handle.set(Arc::new(target));
         }
         let keep_serving = run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await;
         handle.clear();

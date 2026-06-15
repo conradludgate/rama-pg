@@ -37,12 +37,24 @@ use bytes::Bytes;
 use rama::error::BoxError;
 use rama::tcp::TokioTcpStream;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::startup::{CancelKey, ProtocolVersion, cancel_request_frame};
 
-/// The backend a client is currently using: where it is, and the key it issued.
+/// What a client's `CancelRequest` does once routed to the session it belongs to.
+/// The built-ins are [`UpstreamCancel`] (forward a `CancelRequest` to a backend)
+/// and [`TokenCancel`] (fire a token, for in-proxy queries); implement it for a
+/// new cancellation mechanism — the registry just calls `cancel`.
+#[async_trait]
+pub trait CancelTarget: std::fmt::Debug + Send + Sync + 'static {
+    /// Perform the cancellation (dial a backend, fire a token, …). Best-effort.
+    async fn cancel(&self) -> Result<(), BoxError>;
+}
+
+/// A [`CancelTarget`] that forwards a `CancelRequest` to the backend running the
+/// client's query (direct / pooled modes).
 #[derive(Debug, Clone)]
-pub struct UpstreamSession {
+pub struct UpstreamCancel {
     /// `host:port` of the backend running the client's current query.
     pub backend: String,
     /// The backend's cancel key (captured from its `BackendKeyData`), reused
@@ -50,11 +62,39 @@ pub struct UpstreamSession {
     pub key: CancelKey,
 }
 
-/// The slot holding a client's current upstream, shared between the forwarder
-/// (which updates it through a [`CancelHandle`]) and the provider (which reads it
-/// on cancel). A custom [`Cancellation`] keeps a clone to read in `cancel` and
-/// hands another to [`CancelHandle::new`].
-pub type CancelSlot = Arc<Mutex<Option<UpstreamSession>>>;
+#[async_trait]
+impl CancelTarget for UpstreamCancel {
+    async fn cancel(&self) -> Result<(), BoxError> {
+        // Open a fresh connection and deliver the backend's own cancel key.
+        // Postgres acts on it and closes the socket; no reply awaited.
+        let mut conn = TokioTcpStream::connect(&self.backend).await?;
+        conn.write_all(&cancel_request_frame(self.key.as_bytes())).await?;
+        conn.flush().await?;
+        tracing::info!(backend = %self.backend, "forwarded cancel request upstream");
+        Ok(())
+    }
+}
+
+/// A [`CancelTarget`] that fires a [`CancellationToken`] — for an in-proxy
+/// [`QueryHandler`](crate::query::QueryHandler) that cancels cooperatively (there
+/// is no backend to interrupt).
+#[derive(Debug, Clone)]
+pub struct TokenCancel(pub CancellationToken);
+
+#[async_trait]
+impl CancelTarget for TokenCancel {
+    async fn cancel(&self) -> Result<(), BoxError> {
+        self.0.cancel();
+        tracing::info!("cancelled an in-proxy query");
+        Ok(())
+    }
+}
+
+/// The slot holding a client's current [`CancelTarget`], shared between the
+/// forwarder (which updates it through a [`CancelHandle`]) and the provider
+/// (which invokes it on cancel). A custom [`Cancellation`] keeps a clone to read
+/// in `cancel` and hands another to [`CancelHandle::new`].
+pub type CancelSlot = Arc<Mutex<Option<Arc<dyn CancelTarget>>>>;
 
 /// A live client cancel session. The forwarder calls [`set`](Self::set) when the
 /// client acquires a backend and [`clear`](Self::clear) when it releases one;
@@ -85,14 +125,15 @@ impl CancelHandle {
         }
     }
 
-    /// Record the backend the client is now using (call on lease-acquire, or once
-    /// for a fixed 1:1 backend).
-    pub fn set(&self, upstream: UpstreamSession) {
-        *self.slot.lock().unwrap() = Some(upstream);
+    /// Record what the client's cancel should act on now — e.g. an
+    /// [`UpstreamCancel`] (its current backend, on lease-acquire or once for a
+    /// fixed 1:1 backend) or a [`TokenCancel`] (a per-query token).
+    pub fn set(&self, target: Arc<dyn CancelTarget>) {
+        *self.slot.lock().unwrap() = Some(target);
     }
 
-    /// Clear the current backend (call on lease-release; the client is idle, so a
-    /// cancel arriving now has nothing to act on).
+    /// Clear the current target (the client is idle, so a cancel arriving now has
+    /// nothing to act on).
     pub fn clear(&self) {
         *self.slot.lock().unwrap() = None;
     }
@@ -182,18 +223,13 @@ impl Cancellation for RegistryCancellation {
 
     async fn cancel(&self, key: CancelKey) -> Result<(), BoxError> {
         let slot = self.sessions.lock().unwrap().get(&key).cloned();
-        let target = slot.and_then(|slot| slot.lock().unwrap().clone());
-        let Some(session) = target else {
-            tracing::debug!("cancel request for an unknown or idle key; ignoring");
-            return Ok(());
-        };
-        // Open a fresh connection to the backend and deliver its own cancel key.
-        // Postgres acts on it and closes the socket; we don't await a reply.
-        let mut conn = TokioTcpStream::connect(&session.backend).await?;
-        conn.write_all(&cancel_request_frame(session.key.as_bytes())).await?;
-        conn.flush().await?;
-        tracing::info!(backend = %session.backend, "forwarded cancel request upstream");
-        Ok(())
+        match slot.and_then(|slot| slot.lock().unwrap().clone()) {
+            Some(target) => target.cancel().await,
+            None => {
+                tracing::debug!("cancel request for an unknown or idle key; ignoring");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -222,8 +258,8 @@ mod tests {
     use super::*;
     use crate::protocol::startup::ProtocolVersion;
 
-    fn session() -> UpstreamSession {
-        UpstreamSession {
+    fn upstream() -> UpstreamCancel {
+        UpstreamCancel {
             backend: "127.0.0.1:5432".to_owned(),
             key: CancelKey::from_bytes(Bytes::from_static(&[0, 0, 0, 1, 9, 9, 9, 9])),
         }
@@ -254,17 +290,31 @@ mod tests {
         let (key, handle) = registry.begin(ProtocolVersion::V3_0).await.unwrap();
         let key = key.unwrap();
 
-        // Idle (no backend set yet) → best-effort no-op, not an error.
+        // Idle (no target set yet) → best-effort no-op, not an error.
         registry.cancel(key.clone()).await.unwrap();
 
-        // After set, the target is the one we'd dial (we don't assert the dial
-        // here — that needs a live backend; covered end-to-end against Postgres).
-        handle.set(session());
+        // After set, the registry holds a target to invoke on cancel (we don't
+        // assert the dial here — that needs a live backend; covered end-to-end).
+        handle.set(Arc::new(upstream()));
         let slot = registry.sessions.lock().unwrap().get(&key).cloned().unwrap();
-        assert_eq!(slot.lock().unwrap().as_ref().unwrap().backend, "127.0.0.1:5432");
+        assert!(slot.lock().unwrap().is_some());
 
         handle.clear();
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_target_fires_the_token_on_cancel() {
+        let registry = RegistryCancellation::new();
+        let (key, handle) = registry.begin(ProtocolVersion::V3_0).await.unwrap();
+        let key = key.unwrap();
+
+        let token = CancellationToken::new();
+        handle.set(Arc::new(TokenCancel(token.clone())));
+        assert!(!token.is_cancelled());
+
+        registry.cancel(key).await.unwrap();
+        assert!(token.is_cancelled()); // the in-proxy query is now cancelled
     }
 
     #[tokio::test]

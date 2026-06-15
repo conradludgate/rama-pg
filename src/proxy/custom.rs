@@ -2,27 +2,34 @@
 
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rama::Service;
 use rama::error::BoxError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
+use crate::cancel::{CancelHandle, Cancellation, TokenCancel};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message::{
     command_complete, data_row, error_response, parameter_status, ready_for_query, row_description,
 };
+use crate::protocol::startup::CancelKey;
 use crate::query::{QueryContext, QueryHandler, QueryResponse, SessionState, TxnStatus};
 
 /// Custom forwarding: answer queries in-proxy with no backend at all.
 pub struct CustomForwarder {
     handler: Arc<dyn QueryHandler>,
+    cancellation: Arc<dyn Cancellation>,
 }
 
 impl CustomForwarder {
-    pub fn new(handler: Arc<dyn QueryHandler>) -> Self {
-        Self { handler }
+    pub fn new(handler: Arc<dyn QueryHandler>, cancellation: Arc<dyn Cancellation>) -> Self {
+        Self {
+            handler,
+            cancellation,
+        }
     }
 }
 
@@ -37,14 +44,17 @@ where
         let PgClient {
             stream,
             startup,
+            protocol_version,
             sni,
             auth,
-            ..
         } = client;
         let user = startup.user().unwrap_or_default().to_owned();
         let database = startup.database().unwrap_or_default().to_owned();
         tracing::info!(?sni, user, "custom query session");
-        serve_custom(stream, &user, &database, auth, self.handler.clone()).await
+        // Begin a cancel session: the key to advertise, and a handle the loop
+        // points at a fresh per-query token so a client's CancelRequest fires it.
+        let (client_key, handle) = self.cancellation.begin(protocol_version).await?;
+        serve_custom(stream, &user, &database, auth, self.handler.clone(), client_key, &handle).await
     }
 }
 
@@ -53,12 +63,15 @@ where
 /// transaction status in a per-connection [`SessionState`] for `ReadyForQuery`.
 ///
 /// Only the simple query protocol is supported (no extended Parse/Bind/Execute).
+#[allow(clippy::too_many_arguments)]
 async fn serve_custom<C>(
     mut stream: C,
     user: &str,
     database: &str,
     outcome: ClientAuth,
     handler: Arc<dyn QueryHandler>,
+    client_key: Option<CancelKey>,
+    handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -72,15 +85,16 @@ where
         .await;
     }
 
-    // Synthesize the startup completion (there is no backend to capture from).
-    // Custom mode has no upstream query to cancel, so the BackendKeyData is a
-    // throwaway — a client's CancelRequest will simply find no mapping.
+    // Synthesize the startup completion (there is no backend to capture from),
+    // advertising the cancel key the provider issued (or a throwaway when off).
     let params: Vec<BytesMut> = VIRTUAL_PARAMETERS
         .iter()
         .map(|(name, value)| parameter_status(name, value))
         .collect();
-    let cancel_key = rand::random::<u64>().to_be_bytes();
-    synthesize_startup(&mut stream, &params, &cancel_key).await?;
+    let cancel_key = client_key.unwrap_or_else(|| {
+        CancelKey::from_bytes(Bytes::copy_from_slice(&rand::random::<u64>().to_be_bytes()))
+    });
+    synthesize_startup(&mut stream, &params, cancel_key.as_bytes()).await?;
 
     let state = SessionState::default();
     loop {
@@ -91,7 +105,13 @@ where
         match message.tag() {
             codec::QUERY => {
                 let sql = query_sql(message.payload());
-                run_query(&mut stream, &state, &*handler, user, database, sql).await?;
+                // A fresh token per query (a prior cancel must not pre-cancel this
+                // one); point the cancel handle at it for the query's duration.
+                let cancel = CancellationToken::new();
+                handle.set(Arc::new(TokenCancel(cancel.clone())));
+                let result = run_query(&mut stream, &state, &*handler, user, database, sql, &cancel).await;
+                handle.clear();
+                result?;
             }
             codec::TERMINATE => break,
             other => {
@@ -133,6 +153,7 @@ fn query_sql(payload: &[u8]) -> &str {
 
 /// Run one simple query: handle transaction control locally, delegate the rest
 /// to the handler, then emit `ReadyForQuery` with the current transaction status.
+#[allow(clippy::too_many_arguments)]
 async fn run_query<C>(
     client: &mut C,
     state: &SessionState,
@@ -140,6 +161,7 @@ async fn run_query<C>(
     user: &str,
     database: &str,
     sql: &str,
+    cancel: &CancellationToken,
 ) -> Result<(), BoxError>
 where
     C: AsyncWrite + Unpin,
@@ -178,7 +200,7 @@ where
                 client.write_all(&command_complete("ROLLBACK")).await?;
             }
             _ => {
-                let ctx = QueryContext { user, database, state };
+                let ctx = QueryContext { user, database, state, cancel };
                 match handler.handle(ctx, trimmed).await {
                     QueryResponse::Rows { columns, rows, tag } => {
                         let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
