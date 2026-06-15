@@ -411,9 +411,9 @@ where
 
 ### Protocol (`rama_pg::protocol`)
 
-- **`startup`** — `SSLRequest` / `StartupMessage` / `CancelRequest` parsing, plus
-  protocol-version helpers (`negotiated_version`, `pq_options`,
-  `MAX_PROTOCOL_VERSION`).
+- **`startup`** — `SSLRequest` / `StartupMessage` (owns its raw frame) /
+  `CancelRequest` parsing, the `ProtocolVersion` and `CancelKey` newtypes, and
+  negotiation helpers (`StartupMessage::negotiated_version` / `pq_options`).
 - **`codec`** — tagged frames, `read_message` (+ the capped pre-auth variant),
   and the cancel-safe `FramedReader`.
 - **`message`** — server-message builders.
