@@ -13,6 +13,7 @@ use crate::auth::{BackendAuth, ClientAuth};
 use crate::cancel::{CancelHandle, Cancellation, UpstreamSession};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
+use crate::protocol::startup::PROTOCOL_VERSION_3_0;
 use crate::route::Router;
 
 /// `Authentication` sub-type for success (`AuthenticationOk`).
@@ -47,6 +48,10 @@ where
             mut stream,
             startup_frame,
             startup,
+            // Direct mode relays the backend's own version negotiation, so it
+            // issues a conservative 8-byte cancel key (valid for any version)
+            // rather than sizing one to a version the backend may yet downgrade.
+            protocol_version: _,
             sni,
             auth,
         } = client;
@@ -83,7 +88,7 @@ where
         // Begin a cancel session: `client_key` is advertised to the client, and
         // the `handle` records this backend once we capture its BackendKeyData.
         // The handle deregisters the key when this `serve` returns (session end).
-        let (client_key, handle) = self.cancellation.begin().await?;
+        let (client_key, handle) = self.cancellation.begin(PROTOCOL_VERSION_3_0).await?;
 
         // Relay the backend's startup completion to the client, intercepting
         // BackendKeyData so cancellation can be mediated. In pass-through the

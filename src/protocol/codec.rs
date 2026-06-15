@@ -23,6 +23,9 @@ pub const PARAMETER_STATUS: u8 = b'S';
 pub const READY_FOR_QUERY: u8 = b'Z';
 /// `ErrorResponse`.
 pub const ERROR_RESPONSE: u8 = b'E';
+/// `NegotiateProtocolVersion` — sent when the client asked for a newer minor
+/// version (or unknown `_pq_` options) than the server supports.
+pub const NEGOTIATE_PROTOCOL_VERSION: u8 = b'v';
 /// `RowDescription` — column metadata preceding a result set.
 pub const ROW_DESCRIPTION: u8 = b'T';
 /// `DataRow` — one row of a result set.

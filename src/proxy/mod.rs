@@ -36,7 +36,10 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::auth::{AuthContext, Authenticator, ClientAuth};
 use crate::cancel::Cancellation;
 use crate::pool::BackendPool;
-use crate::protocol::message::{authentication_ok, backend_key_data_raw, fatal_error, ready_for_query};
+use crate::protocol::message::{
+    authentication_ok, backend_key_data_raw, fatal_error, negotiate_protocol_version,
+    ready_for_query,
+};
 use crate::protocol::startup::{
     StartupMessage, StartupRequest, read_startup_frame, read_startup_request,
 };
@@ -57,6 +60,9 @@ pub struct PgClient<IO> {
     pub startup_frame: BytesMut,
     /// The parsed startup parameters.
     pub startup: StartupMessage,
+    /// The negotiated protocol version (the client's request capped at the
+    /// proxy's max). Synthesized modes size their cancel key to it.
+    pub protocol_version: i32,
     /// The TLS SNI, if the client sent one.
     pub sni: Option<String>,
     /// How the client authenticated — decides backend handling.
@@ -228,6 +234,27 @@ where
             }
         };
 
+        // Only protocol major 3 exists.
+        if startup.protocol_major() != 3 {
+            tracing::warn!(version = startup.protocol_version, "unsupported protocol major version");
+            return reject(&mut stream, "0A000", "rama-pg: unsupported protocol major version").await;
+        }
+        // When the proxy terminates auth it is the negotiation authority: tell the
+        // client about a minor-version downgrade or unrecognized `_pq_` options
+        // *before* challenging it (pass-through lets the backend negotiate). The
+        // negotiated version then sizes the synthesized cancel key.
+        let negotiated = startup.negotiated_version();
+        if self.auth.terminates() {
+            let unsupported: Vec<&str> = startup.pq_options().collect();
+            if negotiated != startup.protocol_version || !unsupported.is_empty() {
+                tracing::info!(requested = startup.protocol_version, negotiated, "negotiating protocol version");
+                stream
+                    .write_all(&negotiate_protocol_version(negotiated, &unsupported))
+                    .await?;
+                stream.flush().await?;
+            }
+        }
+
         // Authenticate the client; the outcome decides how the forwarder reaches
         // the backend.
         let auth_ctx = AuthContext {
@@ -241,6 +268,7 @@ where
                 stream,
                 startup_frame,
                 startup,
+                protocol_version: negotiated,
                 sni,
                 auth,
             })

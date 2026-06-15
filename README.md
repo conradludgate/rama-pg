@@ -378,7 +378,9 @@ where
 
 ### Protocol (`rama_pg::protocol`)
 
-- **`startup`** — `SSLRequest` / `StartupMessage` / `CancelRequest` parsing.
+- **`startup`** — `SSLRequest` / `StartupMessage` / `CancelRequest` parsing, plus
+  protocol-version helpers (`negotiated_version`, `pq_options`,
+  `MAX_PROTOCOL_VERSION`).
 - **`codec`** — tagged frames, `read_message` (+ the capped pre-auth variant),
   and the cancel-safe `FramedReader`.
 - **`message`** — server-message builders.
@@ -498,9 +500,12 @@ The whole thing is one L4 `Service<TcpStream>` (`PgProxy`):
 2. **Mid-stream TLS upgrade** — hand the *same* socket to rama's
    `TlsAcceptorService`, which reads the ClientHello from the current cursor. The
    SNI lands in the stream's extensions.
-3. **Startup + auth** — `PgSession` reads the `StartupMessage`, runs the
-   pluggable `Authenticator`, and bundles everything into a `PgClient` (stream +
-   startup + SNI + auth outcome).
+3. **Startup + negotiation + auth** — `PgSession` reads the `StartupMessage`;
+   when it terminates auth it negotiates the protocol version (sending
+   `NegotiateProtocolVersion` to downgrade a client that asked for a newer minor
+   than the proxy's max, 3.2, or used unknown `_pq_` options) *before* running
+   the pluggable `Authenticator`. Pass-through lets the backend negotiate
+   (relayed). The result is bundled into a `PgClient`.
 4. **Forward** — `PgClient` is handed to a *forwarding leaf*, itself a
    `rama::Service<PgClient<…>>`: `DirectForwarder` (1:1 relay), `PooledForwarder`
    (pooling + sharding), or `CustomForwarder` (answer in-proxy). The leaf is
@@ -545,8 +550,9 @@ reinventing it:
   the pluggable `Cancellation` provider: the proxy mints an opaque cancel key,
   captures the backend's, and routes a client's `CancelRequest` upstream — to the
   backend it is currently using (tracked per-transaction when pooling), over
-  either the plaintext or the over-TLS cancel path. Protocol 3.2's longer cancel
-  key is not yet negotiated (the key types are already byte-opaque for it).
+  either the plaintext or the over-TLS cancel path. Protocol versions are
+  negotiated (3.0 and 3.2): a synthesized-mode client on 3.2 gets a longer,
+  harder-to-guess cancel key; direct modes issue the classic 4-byte key.
 - **Direct-TLS** (ALPN, client skips `SSLRequest`) is not handled.
 
 ## License

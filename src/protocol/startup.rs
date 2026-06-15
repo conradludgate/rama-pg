@@ -13,7 +13,28 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Postgres protocol 3.0 version number, sent as the code of a `StartupMessage`.
+/// Encoded as `(major << 16) | minor`, so 3.0 is `(3 << 16) | 0`.
 pub const PROTOCOL_VERSION_3_0: i32 = 196608;
+
+/// Postgres protocol 3.2 version number (`(3 << 16) | 2`), introduced in
+/// PostgreSQL 18. Its one wire change the proxy cares about is variable-length
+/// cancel keys (3.0's are a fixed 4 bytes).
+pub const PROTOCOL_VERSION_3_2: i32 = 196610;
+
+/// Highest protocol version the proxy offers clients when it is the negotiating
+/// authority (the synthesized/terminate paths). Newer requests are negotiated
+/// down to this via `NegotiateProtocolVersion`.
+pub const MAX_PROTOCOL_VERSION: i32 = PROTOCOL_VERSION_3_2;
+
+/// The major version of a protocol version number (the high 16 bits).
+pub fn protocol_major(version: i32) -> i32 {
+    (version >> 16) & 0xffff
+}
+
+/// The minor version of a protocol version number (the low 16 bits).
+pub fn protocol_minor(version: i32) -> i32 {
+    version & 0xffff
+}
 
 /// Magic code occupying the version field of an `SSLRequest`.
 pub const SSL_REQUEST_CODE: i32 = 80877103;
@@ -87,6 +108,33 @@ impl StartupMessage {
     /// (matching libpq's behaviour).
     pub fn database(&self) -> Option<&str> {
         self.get("database").or_else(|| self.user())
+    }
+
+    /// The requested major protocol version.
+    pub fn protocol_major(&self) -> i32 {
+        protocol_major(self.protocol_version)
+    }
+
+    /// The requested minor protocol version.
+    pub fn protocol_minor(&self) -> i32 {
+        protocol_minor(self.protocol_version)
+    }
+
+    /// Protocol-extension parameters (`_pq_.*`) the client offered. The proxy
+    /// honours none of them, so these are reported back as unrecognised in a
+    /// `NegotiateProtocolVersion`.
+    pub fn pq_options(&self) -> impl Iterator<Item = &str> {
+        self.parameters
+            .iter()
+            .filter(|(k, _)| k.starts_with("_pq_."))
+            .map(|(k, _)| k.as_str())
+    }
+
+    /// The version the proxy will use with this client: the same major, with the
+    /// minor capped at [`MAX_PROTOCOL_VERSION`].
+    pub fn negotiated_version(&self) -> i32 {
+        let minor = self.protocol_minor().min(protocol_minor(MAX_PROTOCOL_VERSION));
+        (self.protocol_major() << 16) | minor
     }
 }
 
@@ -285,6 +333,36 @@ mod tests {
             StartupRequest::Cancel(c) => assert_eq!(&c.key[..], &body[..]),
             other => panic!("expected cancel, got {other:?}"),
         }
+    }
+
+    fn startup(version: i32, params: &[(&str, &str)]) -> StartupMessage {
+        StartupMessage {
+            protocol_version: version,
+            parameters: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn negotiates_minor_down_to_max() {
+        let msg = startup((3 << 16) | 5, &[]); // client wants 3.5
+        assert_eq!(msg.protocol_major(), 3);
+        assert_eq!(msg.protocol_minor(), 5);
+        assert_eq!(msg.negotiated_version(), PROTOCOL_VERSION_3_2); // capped at 3.2
+    }
+
+    #[test]
+    fn keeps_a_supported_minor() {
+        assert_eq!(startup(PROTOCOL_VERSION_3_0, &[]).negotiated_version(), PROTOCOL_VERSION_3_0);
+        assert_eq!(startup(PROTOCOL_VERSION_3_2, &[]).negotiated_version(), PROTOCOL_VERSION_3_2);
+    }
+
+    #[test]
+    fn collects_pq_options() {
+        let msg = startup(
+            PROTOCOL_VERSION_3_2,
+            &[("user", "alice"), ("_pq_.foo", "1"), ("_pq_.bar", "2")],
+        );
+        assert_eq!(msg.pq_options().collect::<Vec<_>>(), vec!["_pq_.foo", "_pq_.bar"]);
     }
 
     #[tokio::test]

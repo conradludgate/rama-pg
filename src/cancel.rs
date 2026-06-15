@@ -39,7 +39,7 @@ use rama::error::BoxError;
 use rama::tcp::TokioTcpStream;
 use tokio::io::AsyncWriteExt;
 
-use crate::protocol::startup::cancel_request_frame;
+use crate::protocol::startup::{cancel_request_frame, protocol_minor};
 
 /// A boxed future, so [`Cancellation`] is dyn-safe (it is shared as a trait
 /// object across the proxy's startup, forwarding, and cancel paths).
@@ -119,11 +119,14 @@ impl std::fmt::Debug for CancelHandle {
 
 /// Pluggable query-cancellation handling (see the module docs).
 pub trait Cancellation: Send + Sync + 'static {
-    /// Begin a client cancel session. Returns the `BackendKeyData` payload to
-    /// advertise to the client (or `None` to pass the backend's own key through,
-    /// disabling mediation for this session) and a [`CancelHandle`] the forwarder
-    /// uses to track the client's current backend.
-    fn begin(&self) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>>;
+    /// Begin a client cancel session for a client on `protocol_version` (so the
+    /// key can be sized to it — protocol 3.2 allows longer, harder-to-guess
+    /// keys). Returns the `BackendKeyData` payload to advertise to the client (or
+    /// `None` to pass the backend's own key through, disabling mediation for this
+    /// session) and a [`CancelHandle`] the forwarder uses to track the client's
+    /// current backend.
+    fn begin(&self, protocol_version: i32)
+        -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>>;
 
     /// Act on a client's `CancelRequest`: `key` is the payload it presented
     /// (matching a prior [`begin`](Self::begin)). Best-effort — an unknown key, an
@@ -154,12 +157,17 @@ impl RegistryCancellation {
 }
 
 impl Cancellation for RegistryCancellation {
-    fn begin(&self) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
+    fn begin(
+        &self,
+        protocol_version: i32,
+    ) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
         Box::pin(async move {
-            // A fresh opaque 8-byte key (the `Int32 pid` + `Int32 secret` size a
-            // protocol-3.0 client expects). The values are random; the client only
-            // echoes them back, so the proxy never exposes the backend's real key.
-            let mut bytes = [0u8; 8];
+            // A fresh opaque, random key the client only echoes back (so the proxy
+            // never exposes the backend's real key). Protocol 3.0 expects the
+            // classic 8-byte `BackendKeyData` payload (pid + 4-byte secret); 3.2+
+            // allows a longer, harder-to-brute-force key.
+            let len = if protocol_minor(protocol_version) >= 2 { 32 } else { 8 };
+            let mut bytes = vec![0u8; len];
             rand::fill(&mut bytes[..]);
             let key = Bytes::copy_from_slice(&bytes);
 
@@ -201,7 +209,10 @@ impl Cancellation for RegistryCancellation {
 pub struct NoCancellation;
 
 impl Cancellation for NoCancellation {
-    fn begin(&self) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
+    fn begin(
+        &self,
+        _protocol_version: i32,
+    ) -> BoxFuture<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
         Box::pin(async { Ok((None, CancelHandle::disabled())) })
     }
 
@@ -213,6 +224,7 @@ impl Cancellation for NoCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::startup::{PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2};
 
     fn session() -> UpstreamSession {
         UpstreamSession {
@@ -224,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn registry_begins_a_session_and_ends_it_on_drop() {
         let registry = RegistryCancellation::new();
-        let (key, handle) = registry.begin().await.unwrap();
+        let (key, handle) = registry.begin(PROTOCOL_VERSION_3_0).await.unwrap();
         let key = key.unwrap();
         assert_eq!(key.len(), 8); // protocol-3.0-shaped payload
         assert_eq!(registry.len(), 1);
@@ -234,9 +246,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_mints_a_longer_key_for_3_2() {
+        let registry = RegistryCancellation::new();
+        let (key, _handle) = registry.begin(PROTOCOL_VERSION_3_2).await.unwrap();
+        assert_eq!(key.unwrap().len(), 32); // 3.2 allows a longer cancel key
+    }
+
+    #[tokio::test]
     async fn registry_only_acts_when_a_backend_is_set() {
         let registry = RegistryCancellation::new();
-        let (key, handle) = registry.begin().await.unwrap();
+        let (key, handle) = registry.begin(PROTOCOL_VERSION_3_0).await.unwrap();
         let key = key.unwrap();
 
         // Idle (no backend set yet) → best-effort no-op, not an error.
@@ -255,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn no_cancellation_advertises_no_key() {
         let none = NoCancellation;
-        let (key, _handle) = none.begin().await.unwrap();
+        let (key, _handle) = none.begin(PROTOCOL_VERSION_3_0).await.unwrap();
         assert!(key.is_none());
         none.cancel(Bytes::from_static(&[0; 8])).await.unwrap();
     }

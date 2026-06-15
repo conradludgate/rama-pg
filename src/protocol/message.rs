@@ -7,8 +7,8 @@
 use bytes::{BufMut, BytesMut};
 
 use super::codec::{
-    AUTHENTICATION, BACKEND_KEY_DATA, COMMAND_COMPLETE, DATA_ROW, ERROR_RESPONSE, PARAMETER_STATUS,
-    READY_FOR_QUERY, ROW_DESCRIPTION, frame,
+    AUTHENTICATION, BACKEND_KEY_DATA, COMMAND_COMPLETE, DATA_ROW, ERROR_RESPONSE,
+    NEGOTIATE_PROTOCOL_VERSION, PARAMETER_STATUS, READY_FOR_QUERY, ROW_DESCRIPTION, frame,
 };
 
 /// Postgres OID for the `text` type — every column a virtual server emits is
@@ -134,6 +134,19 @@ pub fn backend_key_data_raw(payload: &[u8]) -> BytesMut {
 /// Build a `ReadyForQuery` frame with the given transaction status (`I`/`T`/`E`).
 pub fn ready_for_query(status: u8) -> BytesMut {
     frame(READY_FOR_QUERY, &[status])
+}
+
+/// Build a `NegotiateProtocolVersion` frame: the full protocol `version` the
+/// server will use (which the client must accept or disconnect), then the
+/// `_pq_.*` options the server didn't recognise.
+pub fn negotiate_protocol_version(version: i32, unsupported_options: &[&str]) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(version);
+    body.put_i32(unsupported_options.len() as i32);
+    for option in unsupported_options {
+        put_cstr(&mut body, option);
+    }
+    frame(NEGOTIATE_PROTOCOL_VERSION, &body)
 }
 
 /// Build a fatal `ErrorResponse` frame.

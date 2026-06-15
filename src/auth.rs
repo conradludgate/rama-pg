@@ -59,6 +59,15 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> impl Future<Output = Result<ClientAuth, BoxError>> + Send
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send;
+
+    /// Whether the proxy terminates authentication itself (rather than relaying
+    /// the backend's). When `true`, the proxy is the protocol-negotiation
+    /// authority and sends any `NegotiateProtocolVersion` before challenging the
+    /// client; when `false` (pass-through), the backend negotiates and the proxy
+    /// relays it. Defaults to `true`; a pass-through authenticator must override.
+    fn terminates(&self) -> bool {
+        true
+    }
 }
 
 /// Transparent pass-through: the proxy does not interpret auth at all.
@@ -75,6 +84,10 @@ impl Authenticator for PassThrough {
         IO: AsyncRead + AsyncWrite + Unpin + Send,
     {
         Ok(ClientAuth::PassThrough)
+    }
+
+    fn terminates(&self) -> bool {
+        false // the backend authenticates and negotiates; the proxy relays.
     }
 }
 
@@ -207,6 +220,14 @@ impl<V: PasswordValidator, S: ScramSecretStore> Authenticator for Auth<V, S> {
             Auth::PassThrough(a) => a.authenticate(client, ctx).await,
             Auth::Cleartext(a) => a.authenticate(client, ctx).await,
             Auth::Scram(a) => a.authenticate(client, ctx).await,
+        }
+    }
+
+    fn terminates(&self) -> bool {
+        match self {
+            Auth::PassThrough(a) => a.terminates(),
+            Auth::Cleartext(a) => a.terminates(),
+            Auth::Scram(a) => a.terminates(),
         }
     }
 }

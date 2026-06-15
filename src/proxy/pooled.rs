@@ -37,16 +37,18 @@ where
             stream,
             startup_frame,
             startup,
+            protocol_version,
             sni,
             auth,
         } = client;
         let user = startup.user().unwrap_or_default().to_owned();
         let database = startup.database().unwrap_or_default().to_owned();
         tracing::info!(?sni, user, database, "pooled connection");
-        // Begin a cancel session: the key to advertise, and a handle the relay
-        // updates to point at whichever backend the client is currently leasing.
-        // Dropping the handle at the end of `serve` ends the session.
-        let (client_key, handle) = self.cancellation.begin().await?;
+        // Begin a cancel session: the key to advertise (sized to the negotiated
+        // protocol version), and a handle the relay updates to point at whichever
+        // backend the client is currently leasing. Dropping the handle at the end
+        // of `serve` ends the session.
+        let (client_key, handle) = self.cancellation.begin(protocol_version).await?;
         serve_pooled(
             stream,
             &startup_frame,
