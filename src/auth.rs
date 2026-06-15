@@ -236,11 +236,11 @@ impl<V: PasswordValidator, S: ScramSecretStore> Authenticator for Auth<V, S> {
 mod tests {
     use super::*;
     use crate::protocol::codec::frame;
-    use crate::protocol::startup::PROTOCOL_VERSION_3_0;
+    use crate::protocol::startup::ProtocolVersion;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn startup_for(user: &str) -> StartupMessage {
-        StartupMessage::new(PROTOCOL_VERSION_3_0, vec![("user".to_owned(), user.to_owned())])
+        StartupMessage::new(ProtocolVersion::V3_0, vec![("user".to_owned(), user.to_owned())])
     }
 
     fn alice_creds() -> CleartextPassword<StaticPasswordValidator> {

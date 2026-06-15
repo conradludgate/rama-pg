@@ -12,28 +12,46 @@ use std::io;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Postgres protocol 3.0 version number, sent as the code of a `StartupMessage`.
-/// Encoded as `(major << 16) | minor`, so 3.0 is `(3 << 16) | 0`.
-pub const PROTOCOL_VERSION_3_0: i32 = 196608;
+/// A Postgres protocol version — the code field of a `StartupMessage`, encoded
+/// as `(major << 16) | minor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProtocolVersion(i32);
 
-/// Postgres protocol 3.2 version number (`(3 << 16) | 2`), introduced in
-/// PostgreSQL 18. Its one wire change the proxy cares about is variable-length
-/// cancel keys (3.0's are a fixed 4 bytes).
-pub const PROTOCOL_VERSION_3_2: i32 = 196610;
+impl ProtocolVersion {
+    /// Protocol 3.0 (`(3 << 16) | 0`).
+    pub const V3_0: ProtocolVersion = ProtocolVersion(196608);
+    /// Protocol 3.2 (`(3 << 16) | 2`), PostgreSQL 18+. Its one wire change the
+    /// proxy cares about is variable-length cancel keys (3.0's are a fixed 4 bytes).
+    pub const V3_2: ProtocolVersion = ProtocolVersion(196610);
+    /// Highest version the proxy offers as the negotiation authority (the
+    /// synthesized/terminate paths); newer requests are negotiated down to this.
+    pub const MAX: ProtocolVersion = ProtocolVersion::V3_2;
 
-/// Highest protocol version the proxy offers clients when it is the negotiating
-/// authority (the synthesized/terminate paths). Newer requests are negotiated
-/// down to this via `NegotiateProtocolVersion`.
-pub const MAX_PROTOCOL_VERSION: i32 = PROTOCOL_VERSION_3_2;
+    /// Wrap a raw version code read off the wire.
+    pub const fn from_code(code: i32) -> Self {
+        ProtocolVersion(code)
+    }
 
-/// The major version of a protocol version number (the high 16 bits).
-pub fn protocol_major(version: i32) -> i32 {
-    (version >> 16) & 0xffff
-}
+    /// The raw version code, to write on the wire.
+    pub const fn code(self) -> i32 {
+        self.0
+    }
 
-/// The minor version of a protocol version number (the low 16 bits).
-pub fn protocol_minor(version: i32) -> i32 {
-    version & 0xffff
+    /// The major version (high 16 bits).
+    pub const fn major(self) -> i32 {
+        (self.0 >> 16) & 0xffff
+    }
+
+    /// The minor version (low 16 bits).
+    pub const fn minor(self) -> i32 {
+        self.0 & 0xffff
+    }
+
+    /// The version to use with a client requesting `self`: the same major, with
+    /// the minor capped at [`MAX`](Self::MAX).
+    pub fn negotiated(self) -> ProtocolVersion {
+        ProtocolVersion((self.major() << 16) | self.minor().min(Self::MAX.minor()))
+    }
 }
 
 /// Magic code occupying the version field of an `SSLRequest`.
@@ -115,7 +133,7 @@ impl CancelRequest {
 /// verbatim — no need to carry the raw bytes alongside it.
 #[derive(Debug, Clone, Default)]
 pub struct StartupMessage {
-    protocol_version: i32,
+    protocol_version: ProtocolVersion,
     parameters: Vec<(String, String)>,
     /// The original on-wire frame (empty for a synthetically-built message).
     raw: Bytes,
@@ -124,7 +142,7 @@ pub struct StartupMessage {
 impl StartupMessage {
     /// Build a message with no raw frame, for synthetic use (e.g. tests). A
     /// *parsed* message instead carries its frame; see [`frame`](Self::frame).
-    pub fn new(protocol_version: i32, parameters: Vec<(String, String)>) -> Self {
+    pub fn new(protocol_version: ProtocolVersion, parameters: Vec<(String, String)>) -> Self {
         Self {
             protocol_version,
             parameters,
@@ -138,8 +156,8 @@ impl StartupMessage {
         &self.raw
     }
 
-    /// The requested protocol version code.
-    pub fn protocol_version(&self) -> i32 {
+    /// The requested protocol version.
+    pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }
 
@@ -164,12 +182,12 @@ impl StartupMessage {
 
     /// The requested major protocol version.
     pub fn protocol_major(&self) -> i32 {
-        protocol_major(self.protocol_version)
+        self.protocol_version.major()
     }
 
     /// The requested minor protocol version.
     pub fn protocol_minor(&self) -> i32 {
-        protocol_minor(self.protocol_version)
+        self.protocol_version.minor()
     }
 
     /// Protocol-extension parameters (`_pq_.*`) the client offered. The proxy
@@ -182,11 +200,10 @@ impl StartupMessage {
             .map(|(k, _)| k.as_str())
     }
 
-    /// The version the proxy will use with this client: the same major, with the
-    /// minor capped at [`MAX_PROTOCOL_VERSION`].
-    pub fn negotiated_version(&self) -> i32 {
-        let minor = self.protocol_minor().min(protocol_minor(MAX_PROTOCOL_VERSION));
-        (self.protocol_major() << 16) | minor
+    /// The version the proxy will use with this client (see
+    /// [`ProtocolVersion::negotiated`]).
+    pub fn negotiated_version(&self) -> ProtocolVersion {
+        self.protocol_version.negotiated()
     }
 }
 
@@ -207,7 +224,7 @@ where
 /// proxy opens its own connection to a backend.
 pub fn startup_message(parameters: &[(&str, &str)]) -> BytesMut {
     let mut body = BytesMut::new();
-    body.put_i32(PROTOCOL_VERSION_3_0);
+    body.put_i32(ProtocolVersion::V3_0.code());
     for (key, value) in parameters {
         body.extend_from_slice(key.as_bytes());
         body.put_u8(0);
@@ -277,7 +294,7 @@ impl StartupRequest {
                 key: CancelKey::from_bytes(frame.slice(8..)),
             })),
             version => Ok(StartupRequest::Startup(StartupMessage {
-                protocol_version: version,
+                protocol_version: ProtocolVersion::from_code(version),
                 parameters: parse_parameters(&frame[8..])?,
                 raw: frame,
             })),
@@ -389,7 +406,7 @@ mod tests {
         }
     }
 
-    fn startup(version: i32, params: &[(&str, &str)]) -> StartupMessage {
+    fn startup(version: ProtocolVersion, params: &[(&str, &str)]) -> StartupMessage {
         StartupMessage::new(
             version,
             params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -398,22 +415,22 @@ mod tests {
 
     #[test]
     fn negotiates_minor_down_to_max() {
-        let msg = startup((3 << 16) | 5, &[]); // client wants 3.5
+        let msg = startup(ProtocolVersion::from_code((3 << 16) | 5), &[]); // client wants 3.5
         assert_eq!(msg.protocol_major(), 3);
         assert_eq!(msg.protocol_minor(), 5);
-        assert_eq!(msg.negotiated_version(), PROTOCOL_VERSION_3_2); // capped at 3.2
+        assert_eq!(msg.negotiated_version(), ProtocolVersion::V3_2); // capped at 3.2
     }
 
     #[test]
     fn keeps_a_supported_minor() {
-        assert_eq!(startup(PROTOCOL_VERSION_3_0, &[]).negotiated_version(), PROTOCOL_VERSION_3_0);
-        assert_eq!(startup(PROTOCOL_VERSION_3_2, &[]).negotiated_version(), PROTOCOL_VERSION_3_2);
+        assert_eq!(startup(ProtocolVersion::V3_0, &[]).negotiated_version(), ProtocolVersion::V3_0);
+        assert_eq!(startup(ProtocolVersion::V3_2, &[]).negotiated_version(), ProtocolVersion::V3_2);
     }
 
     #[test]
     fn collects_pq_options() {
         let msg = startup(
-            PROTOCOL_VERSION_3_2,
+            ProtocolVersion::V3_2,
             &[("user", "alice"), ("_pq_.foo", "1"), ("_pq_.bar", "2")],
         );
         assert_eq!(msg.pq_options().collect::<Vec<_>>(), vec!["_pq_.foo", "_pq_.bar"]);
@@ -422,10 +439,10 @@ mod tests {
     #[tokio::test]
     async fn parses_startup_parameters() {
         let body = b"user\0alice\0database\0shop\0\0";
-        let bytes = encode(PROTOCOL_VERSION_3_0, body);
+        let bytes = encode(ProtocolVersion::V3_0.code(), body);
         match parse(&bytes).await.unwrap() {
             StartupRequest::Startup(msg) => {
-                assert_eq!(msg.protocol_version, PROTOCOL_VERSION_3_0);
+                assert_eq!(msg.protocol_version(), ProtocolVersion::V3_0);
                 assert_eq!(msg.user(), Some("alice"));
                 assert_eq!(msg.database(), Some("shop"));
             }
@@ -436,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn database_defaults_to_user() {
         let body = b"user\0bob\0\0";
-        let bytes = encode(PROTOCOL_VERSION_3_0, body);
+        let bytes = encode(ProtocolVersion::V3_0.code(), body);
         match parse(&bytes).await.unwrap() {
             StartupRequest::Startup(msg) => assert_eq!(msg.database(), Some("bob")),
             other => panic!("expected startup, got {other:?}"),
@@ -453,7 +470,7 @@ mod tests {
     async fn frame_preserves_raw_bytes() {
         // The raw frame must round-trip byte-for-byte so it can be forwarded
         // to a backend verbatim.
-        let bytes = encode(PROTOCOL_VERSION_3_0, b"user\0alice\0\0");
+        let bytes = encode(ProtocolVersion::V3_0.code(), b"user\0alice\0\0");
         let frame = read_startup_frame(&mut &bytes[..]).await.unwrap();
         assert_eq!(&frame[..], &bytes[..]);
         // The parsed StartupMessage carries the original frame verbatim.

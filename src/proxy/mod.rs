@@ -41,7 +41,7 @@ use crate::protocol::message::{
     ready_for_query,
 };
 use crate::protocol::startup::{
-    StartupMessage, StartupRequest, read_startup_frame, read_startup_request,
+    ProtocolVersion, StartupMessage, StartupRequest, read_startup_frame, read_startup_request,
 };
 use crate::query::QueryHandler;
 use crate::route::Router;
@@ -61,7 +61,7 @@ pub struct PgClient<IO> {
     pub startup: StartupMessage,
     /// The negotiated protocol version (the client's request capped at the
     /// proxy's max). Synthesized modes size their cancel key to it.
-    pub protocol_version: i32,
+    pub protocol_version: ProtocolVersion,
     /// The TLS SNI, if the client sent one.
     pub sni: Option<String>,
     /// How the client authenticated — decides backend handling.
@@ -249,7 +249,7 @@ where
 
         // Only protocol major 3 exists.
         if startup.protocol_major() != 3 {
-            tracing::warn!(version = startup.protocol_version(), "unsupported protocol major version");
+            tracing::warn!(version = startup.protocol_version().code(), "unsupported protocol major version");
             return reject(&mut stream, "0A000", "rama-pg: unsupported protocol major version").await;
         }
         // When the proxy terminates auth it is the negotiation authority: tell the
@@ -260,7 +260,7 @@ where
         if self.auth.terminates() {
             let unsupported: Vec<&str> = startup.pq_options().collect();
             if negotiated != startup.protocol_version() || !unsupported.is_empty() {
-                tracing::info!(requested = startup.protocol_version(), negotiated, "negotiating protocol version");
+                tracing::info!(requested = startup.protocol_version().code(), negotiated = negotiated.code(), "negotiating protocol version");
                 stream
                     .write_all(&negotiate_protocol_version(negotiated, &unsupported))
                     .await?;

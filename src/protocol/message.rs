@@ -10,6 +10,7 @@ use super::codec::{
     AUTHENTICATION, BACKEND_KEY_DATA, COMMAND_COMPLETE, DATA_ROW, ERROR_RESPONSE,
     NEGOTIATE_PROTOCOL_VERSION, PARAMETER_STATUS, READY_FOR_QUERY, ROW_DESCRIPTION, frame,
 };
+use super::startup::ProtocolVersion;
 
 /// Postgres OID for the `text` type — every column a virtual server emits is
 /// sent as text.
@@ -139,9 +140,9 @@ pub fn ready_for_query(status: u8) -> BytesMut {
 /// Build a `NegotiateProtocolVersion` frame: the full protocol `version` the
 /// server will use (which the client must accept or disconnect), then the
 /// `_pq_.*` options the server didn't recognise.
-pub fn negotiate_protocol_version(version: i32, unsupported_options: &[&str]) -> BytesMut {
+pub fn negotiate_protocol_version(version: ProtocolVersion, unsupported_options: &[&str]) -> BytesMut {
     let mut body = BytesMut::new();
-    body.put_i32(version);
+    body.put_i32(version.code());
     body.put_i32(unsupported_options.len() as i32);
     for option in unsupported_options {
         put_cstr(&mut body, option);
