@@ -40,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::cancel::UpstreamSession;
 use crate::protocol::codec::{self, read_message};
+use crate::protocol::startup::CancelKey;
 
 /// The connection type the pool stores (rama's `TcpStream` carries the
 /// `Extensions` the pool and our captured params live in).
@@ -188,7 +189,9 @@ impl Service<BackendRequest> for PgConnector {
                 codec::PARAMETER_STATUS => params.push(BytesMut::from(msg.as_bytes())),
                 // Capture the backend's cancel key so a client leasing this
                 // connection can be cancelled at whatever backend it lands on.
-                codec::BACKEND_KEY_DATA => cancel_key = Some(Bytes::copy_from_slice(msg.payload())),
+                codec::BACKEND_KEY_DATA => {
+                    cancel_key = Some(CancelKey::from_bytes(Bytes::copy_from_slice(msg.payload())))
+                }
                 codec::READY_FOR_QUERY => break,
                 codec::ERROR_RESPONSE => return Err("pool backend rejected startup".into()),
                 _ => {} // NoticeResponse, etc. — ignored.

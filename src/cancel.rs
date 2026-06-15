@@ -38,16 +38,16 @@ use rama::error::BoxError;
 use rama::tcp::TokioTcpStream;
 use tokio::io::AsyncWriteExt;
 
-use crate::protocol::startup::{cancel_request_frame, protocol_minor};
+use crate::protocol::startup::{CancelKey, cancel_request_frame, protocol_minor};
 
 /// The backend a client is currently using: where it is, and the key it issued.
 #[derive(Debug, Clone)]
 pub struct UpstreamSession {
     /// `host:port` of the backend running the client's current query.
     pub backend: String,
-    /// The backend's `BackendKeyData` payload (`Int32 pid` + secret key), reused
-    /// verbatim as the body of an upstream `CancelRequest`. Length-agnostic.
-    pub key: Bytes,
+    /// The backend's cancel key (captured from its `BackendKeyData`), reused
+    /// verbatim as the body of an upstream `CancelRequest`.
+    pub key: CancelKey,
 }
 
 /// The slot holding a client's current upstream, shared between the forwarder
@@ -124,19 +124,19 @@ pub trait Cancellation: Send + Sync + 'static {
     async fn begin(
         &self,
         protocol_version: i32,
-    ) -> Result<(Option<Bytes>, CancelHandle), BoxError>;
+    ) -> Result<(Option<CancelKey>, CancelHandle), BoxError>;
 
-    /// Act on a client's `CancelRequest`: `key` is the payload it presented
-    /// (matching a prior [`begin`](Self::begin)). Best-effort — an unknown key, an
-    /// idle session, or a delivery failure is generally logged, not surfaced.
-    async fn cancel(&self, key: Bytes) -> Result<(), BoxError>;
+    /// Act on a client's `CancelRequest`: `key` is the one it presented (matching
+    /// a prior [`begin`](Self::begin)). Best-effort — an unknown key, an idle
+    /// session, or a delivery failure is generally logged, not surfaced.
+    async fn cancel(&self, key: CancelKey) -> Result<(), BoxError>;
 }
 
 /// Default [`Cancellation`]: an in-memory registry mapping opaque proxy-issued
 /// keys to each client's current upstream.
 #[derive(Debug, Default, Clone)]
 pub struct RegistryCancellation {
-    sessions: Arc<Mutex<HashMap<Bytes, CancelSlot>>>,
+    sessions: Arc<Mutex<HashMap<CancelKey, CancelSlot>>>,
 }
 
 impl RegistryCancellation {
@@ -159,7 +159,7 @@ impl Cancellation for RegistryCancellation {
     async fn begin(
         &self,
         protocol_version: i32,
-    ) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
+    ) -> Result<(Option<CancelKey>, CancelHandle), BoxError> {
         // A fresh opaque, random key the client only echoes back (so the proxy
         // never exposes the backend's real key). Protocol 3.0 expects the classic
         // 8-byte `BackendKeyData` payload (pid + 4-byte secret); 3.2+ allows a
@@ -167,7 +167,7 @@ impl Cancellation for RegistryCancellation {
         let len = if protocol_minor(protocol_version) >= 2 { 32 } else { 8 };
         let mut bytes = vec![0u8; len];
         rand::fill(&mut bytes[..]);
-        let key = Bytes::copy_from_slice(&bytes);
+        let key = CancelKey::from_bytes(Bytes::copy_from_slice(&bytes));
 
         let slot: CancelSlot = Arc::new(Mutex::new(None));
         self.sessions.lock().unwrap().insert(key.clone(), slot.clone());
@@ -180,7 +180,7 @@ impl Cancellation for RegistryCancellation {
         Ok((Some(key), handle))
     }
 
-    async fn cancel(&self, key: Bytes) -> Result<(), BoxError> {
+    async fn cancel(&self, key: CancelKey) -> Result<(), BoxError> {
         let slot = self.sessions.lock().unwrap().get(&key).cloned();
         let target = slot.and_then(|slot| slot.lock().unwrap().clone());
         let Some(session) = target else {
@@ -190,7 +190,7 @@ impl Cancellation for RegistryCancellation {
         // Open a fresh connection to the backend and deliver its own cancel key.
         // Postgres acts on it and closes the socket; we don't await a reply.
         let mut conn = TokioTcpStream::connect(&session.backend).await?;
-        conn.write_all(&cancel_request_frame(&session.key)).await?;
+        conn.write_all(&cancel_request_frame(session.key.as_bytes())).await?;
         conn.flush().await?;
         tracing::info!(backend = %session.backend, "forwarded cancel request upstream");
         Ok(())
@@ -208,11 +208,11 @@ impl Cancellation for NoCancellation {
     async fn begin(
         &self,
         _protocol_version: i32,
-    ) -> Result<(Option<Bytes>, CancelHandle), BoxError> {
+    ) -> Result<(Option<CancelKey>, CancelHandle), BoxError> {
         Ok((None, CancelHandle::disabled()))
     }
 
-    async fn cancel(&self, _key: Bytes) -> Result<(), BoxError> {
+    async fn cancel(&self, _key: CancelKey) -> Result<(), BoxError> {
         Ok(())
     }
 }
@@ -225,7 +225,7 @@ mod tests {
     fn session() -> UpstreamSession {
         UpstreamSession {
             backend: "127.0.0.1:5432".to_owned(),
-            key: Bytes::from_static(&[0, 0, 0, 1, 9, 9, 9, 9]),
+            key: CancelKey::from_bytes(Bytes::from_static(&[0, 0, 0, 1, 9, 9, 9, 9])),
         }
     }
 
@@ -234,7 +234,7 @@ mod tests {
         let registry = RegistryCancellation::new();
         let (key, handle) = registry.begin(PROTOCOL_VERSION_3_0).await.unwrap();
         let key = key.unwrap();
-        assert_eq!(key.len(), 8); // protocol-3.0-shaped payload
+        assert_eq!(key.as_bytes().len(), 8); // protocol-3.0-shaped payload
         assert_eq!(registry.len(), 1);
 
         drop(handle);
@@ -245,7 +245,7 @@ mod tests {
     async fn registry_mints_a_longer_key_for_3_2() {
         let registry = RegistryCancellation::new();
         let (key, _handle) = registry.begin(PROTOCOL_VERSION_3_2).await.unwrap();
-        assert_eq!(key.unwrap().len(), 32); // 3.2 allows a longer cancel key
+        assert_eq!(key.unwrap().as_bytes().len(), 32); // 3.2 allows a longer cancel key
     }
 
     #[tokio::test]
@@ -272,6 +272,6 @@ mod tests {
         let none = NoCancellation;
         let (key, _handle) = none.begin(PROTOCOL_VERSION_3_0).await.unwrap();
         assert!(key.is_none());
-        none.cancel(Bytes::from_static(&[0; 8])).await.unwrap();
+        none.cancel(CancelKey::from_bytes(Bytes::from_static(&[0; 8]))).await.unwrap();
     }
 }

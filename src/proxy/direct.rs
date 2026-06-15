@@ -13,7 +13,7 @@ use crate::auth::{BackendAuth, ClientAuth};
 use crate::cancel::{CancelHandle, Cancellation, UpstreamSession};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
-use crate::protocol::startup::PROTOCOL_VERSION_3_0;
+use crate::protocol::startup::{CancelKey, PROTOCOL_VERSION_3_0};
 use crate::route::Router;
 
 /// `Authentication` sub-type for success (`AuthenticationOk`).
@@ -132,7 +132,7 @@ async fn relay_startup<C, B>(
     client: &mut C,
     backend: &mut B,
     backend_addr: &str,
-    client_key: &Option<Bytes>,
+    client_key: &Option<CancelKey>,
     handle: &CancelHandle,
     interactive_auth: bool,
 ) -> Result<(), BoxError>
@@ -174,9 +174,9 @@ where
                     Some(key) => {
                         handle.set(UpstreamSession {
                             backend: backend_addr.to_owned(),
-                            key: Bytes::copy_from_slice(msg.payload()),
+                            key: CancelKey::from_bytes(Bytes::copy_from_slice(msg.payload())),
                         });
-                        client.write_all(&message::backend_key_data_raw(key)).await?;
+                        client.write_all(&message::backend_key_data_raw(key.as_bytes())).await?;
                     }
                     None => client.write_all(msg.as_bytes()).await?,
                 }

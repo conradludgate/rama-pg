@@ -12,6 +12,7 @@ use crate::auth::ClientAuth;
 use crate::cancel::{CancelHandle, Cancellation};
 use crate::pool::{BackendPool, Lease, PoolMode};
 use crate::protocol::codec;
+use crate::protocol::startup::CancelKey;
 
 /// Transaction-pooling forwarding (with round-robin replica sharding).
 pub struct PooledForwarder {
@@ -72,7 +73,7 @@ async fn serve_pooled<C>(
     database: &str,
     outcome: ClientAuth,
     pool: Arc<BackendPool>,
-    client_key: Option<Bytes>,
+    client_key: Option<CancelKey>,
     handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
@@ -99,9 +100,10 @@ where
         }
     };
     // Advertise the cancel key the provider issued, or a throwaway one when disabled.
-    let cancel_key = client_key
-        .unwrap_or_else(|| Bytes::copy_from_slice(&rand::random::<u64>().to_be_bytes()));
-    synthesize_startup(&mut stream, &params, &cancel_key).await?;
+    let cancel_key = client_key.unwrap_or_else(|| {
+        CancelKey::from_bytes(Bytes::copy_from_slice(&rand::random::<u64>().to_be_bytes()))
+    });
+    synthesize_startup(&mut stream, &params, cancel_key.as_bytes()).await?;
 
     match pool.mode() {
         // One backend for the whole connection — relay opaquely until disconnect.

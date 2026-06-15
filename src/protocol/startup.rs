@@ -60,25 +60,52 @@ pub enum StartupRequest {
     Startup(StartupMessage),
 }
 
-/// A `CancelRequest`: identifies the backend connection to cancel by the key the
-/// server handed out at connection time (in `BackendKeyData`).
-///
-/// The key is kept opaque — the bytes after the cancel code, i.e. `Int32 pid` +
-/// secret key — because that layout matches a `BackendKeyData` payload exactly
-/// and can be reused verbatim to cancel upstream. It is 8 bytes in protocol 3.0
-/// and longer in 3.2; treating it as bytes keeps both working unchanged.
+/// A Postgres cancel key: the opaque `Int32 pid` + secret-key bytes carried
+/// identically by a `BackendKeyData` payload and a `CancelRequest` body, so one
+/// can be reused verbatim as the other. Length-agnostic (8 bytes in protocol 3.0,
+/// longer in 3.2). The secret is never shown in `Debug`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CancelKey(Bytes);
+
+impl CancelKey {
+    /// Wrap the raw `pid + secret` payload bytes.
+    pub fn from_bytes(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw payload, to forward as a `CancelRequest` body or `BackendKeyData`.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The process id being targeted (the leading `Int32`), for logging. `None`
+    /// if the key is too short.
+    pub fn process_id(&self) -> Option<i32> {
+        self.0.get(..4).map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+    }
+}
+
+impl std::fmt::Debug for CancelKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the secret: show only the pid and length.
+        f.debug_struct("CancelKey")
+            .field("process_id", &self.process_id())
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+/// A `CancelRequest`: identifies the backend connection to cancel by the
+/// [`CancelKey`] the server handed out at connection time (in `BackendKeyData`).
 #[derive(Debug, Clone)]
 pub struct CancelRequest {
-    pub key: Bytes,
+    pub key: CancelKey,
 }
 
 impl CancelRequest {
-    /// The process id being targeted (the leading `Int32` of the key), for
-    /// logging. `None` if the key is too short.
+    /// The process id being targeted, for logging.
     pub fn process_id(&self) -> Option<i32> {
-        self.key
-            .get(..4)
-            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+        self.key.process_id()
     }
 }
 
@@ -221,7 +248,7 @@ impl StartupRequest {
             // (pid + Int32 secret), 3.2's is longer. The bytes after the code are
             // captured opaquely.
             CANCEL_REQUEST_CODE if len >= 16 => Ok(StartupRequest::Cancel(CancelRequest {
-                key: Bytes::copy_from_slice(buf),
+                key: CancelKey::from_bytes(Bytes::copy_from_slice(buf)),
             })),
             version => Ok(StartupRequest::Startup(StartupMessage {
                 protocol_version: version,
@@ -304,7 +331,7 @@ mod tests {
         match parse(&bytes).await.unwrap() {
             StartupRequest::Cancel(c) => {
                 assert_eq!(c.process_id(), Some(42));
-                assert_eq!(&c.key[..], &body[..]);
+                assert_eq!(c.key.as_bytes(), &body[..]);
             }
             other => panic!("expected cancel, got {other:?}"),
         }
@@ -317,7 +344,7 @@ mod tests {
         let frame = cancel_request_frame(&key);
         match read_startup_request(&mut &frame[..]).await.unwrap() {
             StartupRequest::Cancel(c) => {
-                assert_eq!(&c.key[..], &key[..]);
+                assert_eq!(c.key.as_bytes(), &key[..]);
                 assert_eq!(c.process_id(), Some(7));
             }
             other => panic!("expected cancel, got {other:?}"),
@@ -330,7 +357,7 @@ mod tests {
         let body = vec![0xab; 32];
         let bytes = encode(CANCEL_REQUEST_CODE, &body);
         match parse(&bytes).await.unwrap() {
-            StartupRequest::Cancel(c) => assert_eq!(&c.key[..], &body[..]),
+            StartupRequest::Cancel(c) => assert_eq!(c.key.as_bytes(), &body[..]),
             other => panic!("expected cancel, got {other:?}"),
         }
     }
