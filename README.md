@@ -19,8 +19,8 @@ onto a non-HTTP protocol.
 The docs document the **library**: a [Diátaxis](https://diataxis.fr)
 **tutorial** to build a proxy with it, **how-to guides** for its extension seams,
 **reference** for the API surface, and **explanation** for the design. The
-`rama-pg-example` and `pgbouncer` crates are *showcases* of the library — see
-[Example showcases](#example-showcases).
+`pgbouncer` crate is a *showcase* of the library — see
+[Example showcase](#example-showcase).
 
 ---
 
@@ -48,7 +48,7 @@ use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
-use rama_pg::auth::{Auth, PassThrough};
+use rama_pg::auth::PassThrough;
 use rama_pg::cancel::RegistryCancellation;
 use rama_pg::proxy::PgProxy;
 use rama_pg::route::{Backend, Router};
@@ -62,7 +62,7 @@ async fn main() -> Result<(), BoxError> {
     let router = Arc::new(Router::new().with_default(Backend::new("127.0.0.1:5432")));
 
     // Pass-through auth: the *backend* authenticates the client.
-    let auth = Arc::new(Auth::PassThrough(PassThrough));
+    let auth = Arc::new(PassThrough);
 
     // Mediate query cancellation with the default in-memory registry.
     let cancellation = Arc::new(RegistryCancellation::new());
@@ -92,10 +92,6 @@ Postgres, and relayed the rest byte-for-byte — your Postgres did the actual
 authentication. The how-to guides swap in auth termination, pooling, and an
 in-proxy query mode by changing the values you pass to `PgProxy`.
 
-> Don't want to write code yet? The `rama-pg-example` crate is exactly this
-> program, configured by environment variables:
-> `RAMA_PG_BACKEND=127.0.0.1:5432 cargo run -p rama-pg-example`.
-
 ---
 
 ## How-to guides
@@ -111,13 +107,11 @@ to a trust backend:
 
 ```rust
 use std::collections::HashMap;
-use rama_pg::auth::{Auth, CleartextPassword, StaticPasswordValidator};
+use rama_pg::auth::{CleartextPassword, StaticPasswordValidator};
 
 let mut creds = HashMap::new();
 creds.insert("alice".to_owned(), "secret".to_owned());
-let auth = Arc::new(Auth::Cleartext(CleartextPassword::new(
-    StaticPasswordValidator::new(creds),
-)));
+let auth = Arc::new(CleartextPassword::new(StaticPasswordValidator::new(creds)));
 ```
 
 ### Check credentials your own way (async)
@@ -139,7 +133,7 @@ impl PasswordValidator for JwtValidator {
         Ok(verify_jwt(password).await?)
     }
 }
-// Auth::Cleartext(CleartextPassword::new(JwtValidator { .. }))
+// Arc::new(CleartextPassword::new(JwtValidator { .. }))
 ```
 
 ### Terminate SCRAM-SHA-256
@@ -149,13 +143,12 @@ plaintext password), then reauthenticates to a SCRAM backend by reusing the
 `ClientKey` it recovered from the client's proof:
 
 ```rust
-use rama_pg::auth::Auth;
 use rama_pg::scram::{ScramSecret, ScramSha256, StaticSecretStore};
 
 // Verifiers held in memory (copy from `SELECT rolpassword FROM pg_authid`)…
 let store = StaticSecretStore::new()
     .with_secret("alice", ScramSecret::parse("SCRAM-SHA-256$4096:<salt>$<stored>:<server>")?);
-let auth = Arc::new(Auth::Scram(ScramSha256::new(store)));
+let auth = Arc::new(ScramSha256::new(store));
 ```
 
 To also offer **SCRAM-SHA-256-PLUS** (channel binding), derive the
@@ -171,7 +164,7 @@ let (cert_chain, key) = self_signed_server_auth(SelfSignedData::default())?;
 let channel_binding = tls_server_end_point(&cert_chain[0]); // leaf cert (SHA-256)
 let tls = TlsAcceptorDataBuilder::new(cert_chain, key)?.build();
 
-let auth = Arc::new(Auth::Scram(ScramSha256::new(store).with_channel_binding(channel_binding)));
+let auth = Arc::new(ScramSha256::new(store).with_channel_binding(channel_binding));
 ```
 
 The proxy then advertises both mechanisms, verifies the client bound to its
@@ -180,20 +173,11 @@ certificate, and rejects a `y`-flag downgrade (a stripped `-PLUS`).
 ### Supply SCRAM verifiers from your own source
 
 `ScramSecretStore` is the async seam for *where verifiers come from*. rama-pg
-ships `StaticSecretStore` (above) and `PgAuthidStore`, which fetches from
-`pg_authid` on demand over a superuser admin connection:
-
-```rust
-use rama_pg::scram::PgAuthidStore;
-
-// host:port, superuser, admin database — read verifiers live from pg_authid.
-let store = PgAuthidStore::new("127.0.0.1:5434", "postgres", "postgres");
-// Auth::Scram(ScramSha256::new(store))
-```
-
-Implement the trait yourself (`async fn get_secret(&self, lookup: SecretLookup)
--> Result<Option<ScramSecret>, BoxError>`) to source verifiers from anywhere —
-a control plane, a secrets manager, etc. — keyed on user / database / SNI.
+ships `StaticSecretStore` (above); implement the trait yourself
+(`async fn get_secret(&self, lookup: SecretLookup) -> Result<Option<ScramSecret>, BoxError>`)
+to source verifiers from anywhere — a control plane, a secrets manager, or (as
+the `pgbouncer` example does) Postgres' own `pg_authid` over an admin connection
+— keyed on user / database / SNI.
 
 ### Pool connections (and load-balance replicas)
 
@@ -350,9 +334,8 @@ where
 ### Auth (`rama_pg::auth`)
 
 - **`Authenticator`** — the trait a mechanism implements (`authenticate(&self,
-  client, ctx)`), returning a `ClientAuth`.
-- **`Auth`** — a ready-made enum dispatching to `PassThrough`, `Cleartext`, or
-  `Scram`, generic over the validator and secret store.
+  client, ctx)`), returning a `ClientAuth`. Built-ins: `PassThrough`,
+  `CleartextPassword`, `ScramSha256` (pick one per `PgProxy`).
 - **`ClientAuth` / `BackendAuth`** — the outcome: pass-through (relay), or
   terminated with a `Trust` or `Scram(keys)` backend handshake.
 - **`PasswordValidator`** — async credential check for `CleartextPassword`;
@@ -365,7 +348,7 @@ where
 - **`tls_server_end_point(cert_der)`** — the `tls-server-end-point` channel-binding
   data (SHA-256 of the leaf cert) to pass to `with_channel_binding`.
 - **`ScramSecretStore`** — async verifier source; `StaticSecretStore` (in-memory)
-  and `PgAuthidStore` (`pg_authid` over an admin connection) are provided.
+  is provided (the `pgbouncer` example adds a `pg_authid`-backed one).
 - **`ScramSecret` / `ScramKeys`** — a parsed verifier and the recovered key
   material reused upstream.
 
@@ -432,7 +415,8 @@ where
 
 ### Crate layout
 
-A Cargo workspace: the `rama-pg` library at the root, plus two showcase binaries.
+A Cargo workspace: the `rama-pg` library at the root, plus the `pgbouncer`
+showcase binary.
 
 - `src/proxy/` — the L4 service. `mod.rs` is the front matter (`PgProxy`,
   `PgSession`, `PgClient`); the forwarding modes are one `Service` impl per file
@@ -441,7 +425,7 @@ A Cargo workspace: the `rama-pg` library at the root, plus two showcase binaries
   outcomes, pass-through, and cleartext termination over a `PasswordValidator`.
 - `src/scram/` — SCRAM-SHA-256: `crypto` (primitives + key recovery), `secret`
   (verifier + async `ScramSecretStore`), the server authenticator (`mod.rs`),
-  `client` (upstream reauth), and `authid` (`PgAuthidStore`).
+  and `client` (upstream reauth, password or recovered keys).
 - `src/pool.rs` — pooling + replica sharding on rama's client pool, keyed on
   `(user, database, replica)`.
 - `src/query.rs` — the `QueryHandler` trait, `QueryResponse`, and per-connection
@@ -450,44 +434,16 @@ A Cargo workspace: the `rama-pg` library at the root, plus two showcase binaries
   `NoCancellation` for query cancellation.
 - `src/route.rs` — the SNI router.
 - `src/protocol/` — wire types: `startup`, `codec`, `message`.
-- `rama-pg-example/` & `pgbouncer/` — the showcases (see below).
+- `pgbouncer/` — the showcase (see below).
 
 ---
 
-## Example showcases
+## Example showcase
 
-These two crates **demonstrate** the library; they are not part of its API.
-
-### `rama-pg-example`
-
-The tutorial program, configurable by environment variables so one binary can
-show every mode. `psql` connects with `sslmode=require`; for SNI routing use a
-host *name* plus `hostaddr` (libpq omits SNI for IP literals):
-`host=db.example.com hostaddr=127.0.0.1`.
-
-| Variable                | Meaning                                                       | Default          |
-|-------------------------|---------------------------------------------------------------|------------------|
-| `RAMA_PG_LISTEN`        | listen address                                                | `127.0.0.1:6432` |
-| `RAMA_PG_BACKEND`       | catch-all backend `host:port`                                 | —                |
-| `RAMA_PG_ROUTES`        | exact SNI routes, `sni=host:port` separated by `;`            | —                |
-| `RAMA_PG_AUTH`          | `passthrough`, `cleartext`, or `scram`                        | `passthrough`    |
-| `RAMA_PG_USERS`         | `user:password` pairs separated by `;` (cleartext mode)       | —                |
-| `RAMA_PG_SCRAM_SECRETS` | `user=SCRAM-SHA-256$…` verifiers, `;`-separated (scram mode)   | —                |
-| `RAMA_PG_POOL_SIZE`     | max pooled backend connections; enables pooling when set      | — (direct)       |
-| `RAMA_PG_REPLICAS`      | `host:port` replicas, `,`-separated, to round-robin (pooling) | `RAMA_PG_BACKEND`|
-| `RAMA_PG_POOL_MODE`     | `session`, `transaction`, or `statement` (pooling)            | `transaction`    |
-| `RAMA_PG_BACKEND_USERS` | `user:password` pairs (`;`-sep) to auth to non-trust pool backends | — (trust)   |
-| `RAMA_PG_CUSTOM`        | if set, answer queries in-proxy with no backend               | —                |
-
-```sh
-RAMA_PG_AUTH=cleartext RAMA_PG_USERS="alice:secret" \
-  RAMA_PG_BACKEND=127.0.0.1:5434 cargo run -p rama-pg-example
-```
-
-### `pgbouncer`
-
-A small pgbouncer-alike composed from the library: SCRAM auth with verifiers
-fetched from `pg_authid` on demand, configurable pooling, and an admin console on
+The `pgbouncer` crate **demonstrates** the library end-to-end; it is not part of
+the library's API. A small pgbouncer-alike: SCRAM auth with verifiers fetched
+from `pg_authid` on demand (`pgbouncer/src/pg_authid.rs` — a `ScramSecretStore`
+built on the library's public API), configurable pooling, and an admin console on
 the `pgbouncer` database. Configured by an INI file:
 
 | Section / key                               | Meaning                                              |
