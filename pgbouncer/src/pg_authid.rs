@@ -1,5 +1,7 @@
 //! A [`ScramSecretStore`] that fetches verifiers from Postgres' `pg_authid` on
-//! demand — the realistic source for a proxy that doesn't hold credentials.
+//! demand — pgbouncer's `auth_query` pattern, built on rama-pg's public API
+//! (the [`ScramSecretStore`] trait plus the wire `codec` / `startup_message`
+//! helpers), so it lives in the example rather than the library.
 //!
 //! On each lookup it opens a short-lived admin connection, runs
 //! `SELECT rolpassword FROM pg_authid WHERE rolname = $user`, and parses the
@@ -11,11 +13,10 @@
 use bytes::BytesMut;
 use rama::error::BoxError;
 use rama::tcp::TokioTcpStream;
+use rama_pg::protocol::codec::{self, read_message};
+use rama_pg::protocol::startup::startup_message;
+use rama_pg::scram::{ScramSecret, ScramSecretStore, SecretLookup};
 use tokio::io::AsyncWriteExt;
-
-use super::{ScramSecret, ScramSecretStore, SecretLookup};
-use crate::protocol::codec::{self, read_message};
-use crate::protocol::startup::startup_message;
 
 /// Fetches SCRAM verifiers from a Postgres `pg_authid` over an admin connection.
 #[derive(Debug, Clone)]

@@ -13,6 +13,7 @@
 //! — see `config.rs` and the sample `pgbouncer.ini`.
 
 mod config;
+mod pg_authid;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +30,9 @@ use rama_pg::cancel::RegistryCancellation;
 use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::{CustomForwarder, PgClient, PgProxy, PooledForwarder};
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
-use rama_pg::scram::{PgAuthidStore, ScramSha256, tls_server_end_point};
+use rama_pg::scram::{ScramSha256, tls_server_end_point};
+
+use crate::pg_authid::PgAuthidStore;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing_subscriber::EnvFilter;
 
