@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rama::Service;
 use rama::error::BoxError;
 use rama::extensions::{Extension, Extensions, ExtensionsRef};
@@ -35,6 +35,7 @@ use rama::net::client::pool::{ConnID, LeasedConnection, LruDropPool, PooledConne
 use rama::tcp::{TcpStream, TokioTcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::cancel::UpstreamSession;
 use crate::protocol::codec::{self, read_message};
 
 /// The connection type the pool stores (rama's `TcpStream` carries the
@@ -58,6 +59,14 @@ impl ConnID for PgConnId {}
 struct CapturedParams(Vec<BytesMut>);
 
 impl Extension for CapturedParams {}
+
+/// The backend's cancel target (address + captured `BackendKeyData`), stashed on
+/// the connection so the pooled forwarder can route a client's cancel to whatever
+/// backend it is currently leasing.
+#[derive(Debug, Clone)]
+struct CapturedCancel(UpstreamSession);
+
+impl Extension for CapturedCancel {}
 
 /// The request flowing through the connector + pool: what to dial, the startup
 /// to replay, and the pool key.
@@ -90,6 +99,7 @@ impl Service<BackendRequest> for PgConnector {
         conn.flush().await?;
 
         let mut params = Vec::new();
+        let mut cancel_key = None;
         loop {
             let msg = read_message(&mut conn).await?;
             match msg.tag() {
@@ -109,14 +119,23 @@ impl Service<BackendRequest> for PgConnector {
                     }
                 }
                 codec::PARAMETER_STATUS => params.push(BytesMut::from(msg.as_bytes())),
+                // Capture the backend's cancel key so a client leasing this
+                // connection can be cancelled at whatever backend it lands on.
+                codec::BACKEND_KEY_DATA => cancel_key = Some(Bytes::copy_from_slice(msg.payload())),
                 codec::READY_FOR_QUERY => break,
                 codec::ERROR_RESPONSE => return Err("pool backend rejected startup".into()),
-                _ => {} // BackendKeyData, NoticeResponse, etc. — ignored.
+                _ => {} // NoticeResponse, etc. — ignored.
             }
         }
 
         let conn = TcpStream::new(conn);
         conn.extensions().insert(CapturedParams(params));
+        if let Some(key) = cancel_key {
+            conn.extensions().insert(CapturedCancel(UpstreamSession {
+                backend: req.target.clone(),
+                key,
+            }));
+        }
         Ok(EstablishedClientConnection { input: req, conn })
     }
 }
@@ -272,6 +291,16 @@ impl Lease {
             .get_ref::<CapturedParams>()
             .map(|captured| captured.0.clone())
             .unwrap_or_default()
+    }
+
+    /// The backend's cancel target (address + captured `BackendKeyData`), so the
+    /// forwarder can route a client's `CancelRequest` to this backend while the
+    /// lease is held. `None` if the backend issued no key.
+    pub fn cancel_target(&self) -> Option<UpstreamSession> {
+        self.conn
+            .extensions()
+            .get_ref::<CapturedCancel>()
+            .map(|captured| captured.0.clone())
     }
 
     /// Reset the backend's session state by running `reset_frame` (e.g. the

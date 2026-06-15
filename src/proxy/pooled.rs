@@ -2,23 +2,26 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use rama::Service;
 use rama::error::BoxError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
+use crate::cancel::{CancelHandle, Cancellation};
 use crate::pool::{BackendPool, Lease, PoolMode};
 use crate::protocol::codec;
 
 /// Transaction-pooling forwarding (with round-robin replica sharding).
 pub struct PooledForwarder {
     pool: Arc<BackendPool>,
+    cancellation: Arc<dyn Cancellation>,
 }
 
 impl PooledForwarder {
-    pub fn new(pool: Arc<BackendPool>) -> Self {
-        Self { pool }
+    pub fn new(pool: Arc<BackendPool>, cancellation: Arc<dyn Cancellation>) -> Self {
+        Self { pool, cancellation }
     }
 }
 
@@ -40,11 +43,26 @@ where
         let user = startup.user().unwrap_or_default().to_owned();
         let database = startup.database().unwrap_or_default().to_owned();
         tracing::info!(?sni, user, database, "pooled connection");
-        serve_pooled(stream, &startup_frame, &user, &database, auth, self.pool.clone()).await
+        // Begin a cancel session: the key to advertise, and a handle the relay
+        // updates to point at whichever backend the client is currently leasing.
+        // Dropping the handle at the end of `serve` ends the session.
+        let (client_key, handle) = self.cancellation.begin().await?;
+        serve_pooled(
+            stream,
+            &startup_frame,
+            &user,
+            &database,
+            auth,
+            self.pool.clone(),
+            client_key,
+            &handle,
+        )
+        .await
     }
 }
 
 /// Synthesize the startup completion, then run the pool's mode-specific relay.
+#[allow(clippy::too_many_arguments)]
 async fn serve_pooled<C>(
     mut stream: C,
     startup_frame: &[u8],
@@ -52,6 +70,8 @@ async fn serve_pooled<C>(
     database: &str,
     outcome: ClientAuth,
     pool: Arc<BackendPool>,
+    client_key: Option<Bytes>,
+    handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -66,15 +86,23 @@ where
     }
 
     // The client is idle until it sends a query, so we don't hold a backend yet;
-    // the pool gives us the (cached) ParameterStatus to replay.
+    // the pool gives us the (cached) ParameterStatus to replay. Advertise the
+    // cancel key the provider issued, or a throwaway one when it's disabled.
     let params = pool.startup_params(startup_frame, user, database).await?;
-    synthesize_startup(&mut stream, &params).await?;
+    let cancel_key = client_key
+        .unwrap_or_else(|| Bytes::copy_from_slice(&rand::random::<u64>().to_be_bytes()));
+    synthesize_startup(&mut stream, &params, &cancel_key).await?;
 
     match pool.mode() {
         // One backend for the whole connection — relay opaquely until disconnect.
         PoolMode::Session => {
             let mut lease = pool.lease(startup_frame, user, database).await?;
+            // Point cancellation at this backend for the life of the session.
+            if let Some(target) = lease.cancel_target() {
+                handle.set(target);
+            }
             let outcome = copy_bidirectional(&mut stream, &mut lease).await;
+            handle.clear();
             // The relay is opaque, so we can't prove the backend ended at an idle
             // boundary (the client may have bailed mid-query), and there's no
             // server reset — so never re-pool a session backend; discard it.
@@ -84,7 +112,7 @@ where
             tracing::info!(client_to_backend, backend_to_client, "session-pooled connection closed");
             Ok(())
         }
-        mode => relay_pooled(stream, startup_frame, user, database, pool, mode).await,
+        mode => relay_pooled(stream, startup_frame, user, database, pool, mode, handle).await,
     }
 }
 
@@ -97,6 +125,7 @@ async fn relay_pooled<C>(
     database: &str,
     pool: Arc<BackendPool>,
     mode: PoolMode,
+    handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -115,7 +144,14 @@ where
         }
 
         let lease = pool.lease(startup_frame, user, database).await?;
-        if !run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await? {
+        // Route cancellation at this backend while the client holds the lease;
+        // clear it once the transaction is done (the client is idle again).
+        if let Some(target) = lease.cancel_target() {
+            handle.set(target);
+        }
+        let keep_serving = run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await;
+        handle.clear();
+        if !keep_serving? {
             break; // client gone
         }
     }

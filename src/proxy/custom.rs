@@ -73,11 +73,14 @@ where
     }
 
     // Synthesize the startup completion (there is no backend to capture from).
+    // Custom mode has no upstream query to cancel, so the BackendKeyData is a
+    // throwaway — a client's CancelRequest will simply find no mapping.
     let params: Vec<BytesMut> = VIRTUAL_PARAMETERS
         .iter()
         .map(|(name, value)| parameter_status(name, value))
         .collect();
-    synthesize_startup(&mut stream, &params).await?;
+    let cancel_key = rand::random::<u64>().to_be_bytes();
+    synthesize_startup(&mut stream, &params, &cancel_key).await?;
 
     let state = SessionState::default();
     loop {

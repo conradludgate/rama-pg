@@ -25,7 +25,7 @@ use rama::net::tls::server::SelfSignedData;
 use rama::rt::Executor;
 use rama::tcp::server::TcpListener;
 use rama::tls::rustls::server::TlsAcceptorDataBuilder;
-use rama_pg::cancel::NoCancellation;
+use rama_pg::cancel::RegistryCancellation;
 use rama_pg::pool::{BackendPool, PoolMode};
 use rama_pg::proxy::{CustomForwarder, PgClient, PgProxy, PooledForwarder};
 use rama_pg::query::{QueryContext, QueryHandler, QueryResponse};
@@ -64,25 +64,20 @@ async fn main() -> Result<(), BoxError> {
         config.pool_size,
         vec![config.backend.clone()],
     ));
+    // One cancellation registry shared between the pool forwarder (which records
+    // the backend each client is currently leasing) and the proxy (which routes
+    // an incoming CancelRequest to it).
+    let cancellation = Arc::new(RegistryCancellation::new());
     let forwarder = PgBouncerForwarder {
         admin: CustomForwarder::new(Arc::new(AdminConsole { stats: stats.clone() })),
-        pool: PooledForwarder::new(BackendPool::new(
-            vec![config.backend.clone()],
-            config.pool_size,
-            config.pool_mode,
-        )),
+        pool: PooledForwarder::new(
+            BackendPool::new(vec![config.backend.clone()], config.pool_size, config.pool_mode),
+            cancellation.clone(),
+        ),
         stats,
     };
 
-    // Cancellation mediation is wired for direct mode; pooled-mode cancellation
-    // (tracking the backend a client currently holds) is future work, so disable
-    // it here rather than imply it works.
-    let proxy = Arc::new(PgProxy::with_forwarder(
-        tls,
-        auth,
-        forwarder,
-        Arc::new(NoCancellation),
-    ));
+    let proxy = Arc::new(PgProxy::with_forwarder(tls, auth, forwarder, cancellation));
     tracing::info!(
         listen = %config.listen,
         backend = %config.backend,

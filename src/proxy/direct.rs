@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject};
 use crate::auth::{BackendAuth, ClientAuth};
-use crate::cancel::{Cancellation, UpstreamSession};
+use crate::cancel::{CancelHandle, Cancellation, UpstreamSession};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
 use crate::route::Router;
@@ -80,30 +80,31 @@ where
         upstream.write_all(&startup_frame).await?;
         upstream.flush().await?;
 
+        // Begin a cancel session: `client_key` is advertised to the client, and
+        // the `handle` records this backend once we capture its BackendKeyData.
+        // The handle deregisters the key when this `serve` returns (session end).
+        let (client_key, handle) = self.cancellation.begin().await?;
+
         // Relay the backend's startup completion to the client, intercepting
         // BackendKeyData so cancellation can be mediated. In pass-through the
         // client authenticates with the backend (interactive); in terminate mode
         // we already authenticated it, so we only splice the completion (after
         // satisfying the backend's own auth: nothing for trust, SCRAM reauth).
-        let issued = match auth {
+        match auth {
             ClientAuth::PassThrough => {
-                relay_startup(&mut stream, &mut upstream, &address, &self.cancellation, true).await?
+                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, true).await?
             }
             ClientAuth::Terminated(BackendAuth::Trust) => {
-                relay_startup(&mut stream, &mut upstream, &address, &self.cancellation, false).await?
+                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, false).await?
             }
             ClientAuth::Terminated(BackendAuth::Scram(keys)) => {
                 crate::scram::reauth_upstream(&mut upstream, &keys).await?;
-                relay_startup(&mut stream, &mut upstream, &address, &self.cancellation, false).await?
+                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, false).await?
             }
-        };
-
-        let outcome = copy_bidirectional(&mut stream, &mut upstream).await;
-        // Drop the cancel mapping now the session is over (best-effort).
-        if let Some(key) = issued {
-            self.cancellation.release(key).await;
         }
-        let (client_to_backend, backend_to_client) = outcome?;
+
+        let (client_to_backend, backend_to_client) =
+            copy_bidirectional(&mut stream, &mut upstream).await?;
         tracing::info!(client_to_backend, backend_to_client, "session closed");
         Ok(())
     }
@@ -119,20 +120,21 @@ where
 /// are exactly one message each (`read_message`), so no session bytes are
 /// consumed and the caller can resume an opaque `copy_bidirectional`.
 ///
-/// Returns the cancel key the proxy issued to the client (to release when the
-/// session ends), or `None` if the backend's own key was passed through.
+/// `client_key` is the cancel key to advertise (or `None` to pass the backend's
+/// own through); when set, the backend's captured key is recorded on `handle` so
+/// an incoming `CancelRequest` can be routed to it.
 async fn relay_startup<C, B>(
     client: &mut C,
     backend: &mut B,
     backend_addr: &str,
-    cancellation: &Arc<dyn Cancellation>,
+    client_key: &Option<Bytes>,
+    handle: &CancelHandle,
     interactive_auth: bool,
-) -> Result<Option<Bytes>, BoxError>
+) -> Result<(), BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut issued = None;
     loop {
         let msg = read_message(backend).await?;
         match msg.tag() {
@@ -160,17 +162,16 @@ where
                 }
             }
             codec::BACKEND_KEY_DATA => {
-                // Capture the backend's key, then advertise whatever the
-                // cancellation provider issues (an opaque proxy key, or the
-                // backend's own if it returns None).
-                let session = UpstreamSession {
-                    backend: backend_addr.to_owned(),
-                    key: Bytes::copy_from_slice(msg.payload()),
-                };
-                match cancellation.issue(session).await? {
+                // Record the backend's key for cancellation, then advertise the
+                // proxy-issued key (or pass the backend's own through if
+                // cancellation issued none).
+                match client_key {
                     Some(key) => {
-                        client.write_all(&message::backend_key_data_raw(&key)).await?;
-                        issued = Some(key);
+                        handle.set(UpstreamSession {
+                            backend: backend_addr.to_owned(),
+                            key: Bytes::copy_from_slice(msg.payload()),
+                        });
+                        client.write_all(&message::backend_key_data_raw(key)).await?;
                     }
                     None => client.write_all(msg.as_bytes()).await?,
                 }
@@ -178,7 +179,7 @@ where
             codec::READY_FOR_QUERY => {
                 client.write_all(msg.as_bytes()).await?;
                 client.flush().await?;
-                return Ok(issued);
+                return Ok(());
             }
             codec::ERROR_RESPONSE => {
                 client.write_all(msg.as_bytes()).await?;

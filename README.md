@@ -231,31 +231,38 @@ impl QueryHandler for Echo {
 ### Mediate query cancellation
 
 Cancellation is wired through the `Cancellation` provider passed to `PgProxy`.
-`RegistryCancellation` (used above) mints an opaque cancel key per direct session
-and routes a client's `CancelRequest` to the right backend — nothing else to do.
-Implement the trait to use a different store (e.g. a shared/distributed one):
+`RegistryCancellation` (used above) mints an opaque cancel key per session and
+routes a client's `CancelRequest` to the backend it is currently using — for both
+direct *and* pooled connections, with nothing else to do. A forwarder reports the
+current backend through the `CancelHandle` that `begin` returns: `set` on
+lease-acquire (once for a direct 1:1 backend, per-transaction when pooling),
+`clear` when idle. Implement the trait to use a different (e.g. distributed) store:
 
 ```rust
 use bytes::Bytes;
 use rama::error::BoxError;
-use rama_pg::cancel::{Cancellation, UpstreamSession};
+use rama_pg::cancel::{CancelHandle, Cancellation};
 
-struct MyCancellation { /* a shared map, Redis client, … */ }
+type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+struct MyCancellation { /* a shared/distributed map of key -> CancelSlot */ }
 
 impl Cancellation for MyCancellation {
-    fn issue(&self, upstream: UpstreamSession)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Bytes>, BoxError>> + Send + '_>>
-    {
-        // Record `upstream` (backend + its BackendKeyData) and return the opaque
-        // key to advertise to the client (or None to pass the backend's through).
-        Box::pin(async move { todo!() })
+    fn begin(&self) -> Fut<'_, Result<(Option<Bytes>, CancelHandle), BoxError>> {
+        Box::pin(async move {
+            // Mint a key, make a CancelSlot, store a clone under the key, and
+            // return CancelHandle::new(slot, move || /* deregister the key */).
+            // (Or (None, CancelHandle::disabled()) to pass the backend's through.)
+            todo!()
+        })
     }
 
-    fn cancel(&self, key: Bytes)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BoxError>> + Send + '_>>
-    {
-        // Look `key` up and deliver a CancelRequest to the recorded backend.
-        Box::pin(async move { todo!() })
+    fn cancel(&self, key: Bytes) -> Fut<'_, Result<(), BoxError>> {
+        Box::pin(async move {
+            // Look `key` up, read its slot's current UpstreamSession (if any),
+            // and deliver a CancelRequest to that backend.
+            todo!()
+        })
     }
 }
 ```
@@ -348,14 +355,15 @@ where
 
 ### Cancellation (`rama_pg::cancel`)
 
-- **`Cancellation`** — the pluggable seam: `issue` (assign the client's cancel
-  key + record the upstream session) and `cancel` (route an incoming
-  `CancelRequest`), plus a `release` cleanup hook.
+- **`Cancellation`** — the pluggable seam: `begin` (assign the client's cancel key
+  + return a `CancelHandle`) and `cancel` (route an incoming `CancelRequest`).
+- **`CancelHandle`** — the forwarder reports the client's current backend through
+  it: `set`/`clear`, and it deregisters the key on drop. `CancelSlot` is the
+  shared cell behind it; `UpstreamSession` is a backend address + its key.
 - **`RegistryCancellation`** — default in-memory store: opaque random keys,
-  delivering an upstream `CancelRequest` to the recorded backend. Wired for
-  direct mode (pooled-mode cancellation is future work).
-- **`NoCancellation`** — disables mediation. **`UpstreamSession`** — the backend
-  address + its captured key.
+  delivering an upstream `CancelRequest` to the client's current backend. Works
+  for both direct and pooled connections.
+- **`NoCancellation`** — disables mediation (client sees the backend's own key).
 
 ### Custom queries (`rama_pg::query`)
 
@@ -533,12 +541,12 @@ reinventing it:
   future work. Transaction/statement modes reset reused backends with
   `DISCARD ALL`; session-mode connections are still discarded on close rather
   than reused (the relay is opaque, so there's no idle boundary to reset at).
-- **`CancelRequest` routing** is implemented for **direct mode** via the
-  pluggable `Cancellation` provider (the proxy mints an opaque cancel key,
-  captures the backend's, and routes a client's `CancelRequest` upstream — over
-  either the plaintext or the over-TLS cancel path). Pooled-mode cancellation
-  (tracking the backend a client currently holds) is future work, as is protocol
-  3.2's longer cancel key (the key types are already byte-opaque for it).
+- **`CancelRequest` routing** is implemented for **direct and pooled modes** via
+  the pluggable `Cancellation` provider: the proxy mints an opaque cancel key,
+  captures the backend's, and routes a client's `CancelRequest` upstream — to the
+  backend it is currently using (tracked per-transaction when pooling), over
+  either the plaintext or the over-TLS cancel path. Protocol 3.2's longer cancel
+  key is not yet negotiated (the key types are already byte-opaque for it).
 - **Direct-TLS** (ALPN, client skips `SSLRequest`) is not handled.
 
 ## License
