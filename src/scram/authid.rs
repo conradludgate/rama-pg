@@ -71,7 +71,11 @@ impl PgAuthidStore {
         .await?;
         conn.flush().await?;
 
-        // Drive the (trust) startup to ReadyForQuery.
+        // Drive the (trust) startup to ReadyForQuery, noting whether the server
+        // reports `standard_conforming_strings = on` (it ships this as a
+        // GUC_REPORT ParameterStatus at startup). That setting is what makes the
+        // `'`→`''` escaping below a *complete* defence against injection.
+        let mut standard_conforming_strings = false;
         loop {
             let msg = read_message(&mut conn).await?;
             match msg.tag() {
@@ -86,14 +90,29 @@ impl PgAuthidStore {
                         return Err("pg_authid admin connection requires auth (trust only)".into());
                     }
                 }
+                codec::PARAMETER_STATUS => {
+                    if let Some(("standard_conforming_strings", value)) =
+                        parse_parameter_status(msg.payload())
+                    {
+                        standard_conforming_strings = value == "on";
+                    }
+                }
                 codec::READY_FOR_QUERY => break,
                 codec::ERROR_RESPONSE => return Err("pg_authid admin startup rejected".into()),
                 _ => {}
             }
         }
 
-        // `rolname` is attacker-influenced (it's the client's startup user), so
-        // escape the single quotes in the literal.
+        // `rolname` is attacker-influenced (it's the client's startup user). We
+        // escape it as a string literal by doubling single quotes — but that is
+        // only complete when backslashes are literal, i.e. with
+        // `standard_conforming_strings = on`. If the server has it off (or never
+        // reported it), refuse rather than risk a backslash-escape injection.
+        if !standard_conforming_strings {
+            return Err("pg_authid admin connection: standard_conforming_strings is not 'on'; \
+                        refusing to interpolate the role name into SQL"
+                .into());
+        }
         let escaped = rolname.replace('\'', "''");
         let sql = format!("SELECT rolpassword FROM pg_authid WHERE rolname = '{escaped}'");
         let mut query = BytesMut::from(sql.as_bytes());
@@ -116,6 +135,15 @@ impl PgAuthidStore {
         let _ = conn.write_all(&codec::frame(codec::TERMINATE, &[])).await;
         Ok(value)
     }
+}
+
+/// Parse a `ParameterStatus` payload — two NUL-terminated strings, `name` then
+/// `value` — returning them as a borrowed pair (`None` if malformed/non-UTF-8).
+fn parse_parameter_status(payload: &[u8]) -> Option<(&str, &str)> {
+    let mut parts = payload.split(|&b| b == 0);
+    let name = std::str::from_utf8(parts.next()?).ok()?;
+    let value = std::str::from_utf8(parts.next()?).ok()?;
+    Some((name, value))
 }
 
 /// The first column of a `DataRow` payload as text (`None` if absent or SQL NULL).

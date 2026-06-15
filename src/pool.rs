@@ -19,6 +19,7 @@
 //! v1 scope: trust backends only (the connector can't satisfy a credential
 //! challenge). A single address is just a one-element replica list.
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -153,9 +154,14 @@ pub struct BackendPool {
     replicas: Vec<String>,
     mode: PoolMode,
     next: AtomicUsize,
-    /// `ParameterStatus` captured once (replicas are equivalent) and replayed to
-    /// every client's synthesized startup.
-    params: Mutex<Option<Vec<BytesMut>>>,
+    /// `ParameterStatus` frames captured per `(user, database)` and replayed to
+    /// that role's clients during their synthesized startup. Keyed by role/db so
+    /// role-dependent params (e.g. `is_superuser`) aren't replayed across roles.
+    params: Mutex<HashMap<(String, String), Vec<BytesMut>>>,
+    /// Query run on a backend before it returns to the pool (transaction /
+    /// statement modes), to clear leftover session state so it can't leak to the
+    /// next client that reuses the connection. `None` disables the reset.
+    reset_query: Option<BytesMut>,
     connector: Connector,
 }
 
@@ -175,7 +181,11 @@ impl BackendPool {
             replicas,
             mode,
             next: AtomicUsize::new(0),
-            params: Mutex::new(None),
+            params: Mutex::new(HashMap::new()),
+            // Reset session state before reuse so one client's non-`LOCAL`
+            // `SET`/`PREPARE`/temp-table/`LISTEN` can't leak into the next.
+            // `DISCARD ALL` is the safe default (it runs on standbys too).
+            reset_query: Some(codec::frame(codec::QUERY, b"DISCARD ALL\0")),
             connector: PooledConnector::new(PgConnector, pool, RequestKey),
         })
     }
@@ -185,22 +195,32 @@ impl BackendPool {
         self.mode
     }
 
+    /// The frame to send a backend to reset its session state before it returns
+    /// to the pool, or `None` if resetting is disabled.
+    pub fn reset_query(&self) -> Option<&[u8]> {
+        self.reset_query.as_deref()
+    }
+
     /// The `ParameterStatus` frames to replay to a client during its synthesized
-    /// startup. Captured once from a backend and cached, so it doesn't perturb
-    /// the per-transaction round-robin after the first client.
+    /// startup. Captured once per `(user, database)` and cached, so it doesn't
+    /// perturb the per-transaction round-robin after the first client and a
+    /// role's params aren't replayed to a different role.
     pub async fn startup_params(
         &self,
         startup_frame: &[u8],
         user: &str,
         database: &str,
     ) -> Result<Vec<BytesMut>, BoxError> {
-        if let Some(params) = self.params.lock().unwrap().clone() {
+        let key = (user.to_owned(), database.to_owned());
+        if let Some(params) = self.params.lock().unwrap().get(&key).cloned() {
             return Ok(params);
         }
+        // This lease runs no client SQL, so the backend stays pristine and can
+        // return to the pool without a reset.
         let lease = self.lease(startup_frame, user, database).await?;
         let params = lease.params();
         lease.checkin();
-        *self.params.lock().unwrap() = Some(params.clone());
+        self.params.lock().unwrap().insert(key, params.clone());
         Ok(params)
     }
 
@@ -252,6 +272,32 @@ impl Lease {
             .get_ref::<CapturedParams>()
             .map(|captured| captured.0.clone())
             .unwrap_or_default()
+    }
+
+    /// Reset the backend's session state by running `reset_frame` (e.g. the
+    /// pool's `DISCARD ALL`) and draining its response, so leftover
+    /// `SET`/`PREPARE`/temp-table/`LISTEN` state from the previous transaction
+    /// can't leak to the next client that reuses this backend.
+    ///
+    /// Must be called only at an idle transaction boundary, and the reset itself
+    /// must leave the backend idle (`ReadyForQuery 'I'`). On any error the caller
+    /// should [`discard`](Self::discard) the connection rather than pool it.
+    pub async fn reset(&mut self, reset_frame: &[u8]) -> Result<(), BoxError> {
+        self.conn.write_all(reset_frame).await?;
+        self.conn.flush().await?;
+        loop {
+            let msg = read_message(&mut self.conn).await?;
+            match msg.tag() {
+                codec::READY_FOR_QUERY => {
+                    return match msg.payload().first() {
+                        Some(b'I') => Ok(()),
+                        _ => Err("reset query left the backend in a transaction".into()),
+                    };
+                }
+                codec::ERROR_RESPONSE => return Err("reset query failed".into()),
+                _ => {} // CommandComplete, NoticeResponse, …
+            }
+        }
     }
 
     /// Return the connection to the pool (transaction completed, idle).

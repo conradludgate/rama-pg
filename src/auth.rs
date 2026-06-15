@@ -14,9 +14,10 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use rama::error::BoxError;
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::protocol::codec::{self, read_message};
+use crate::protocol::codec::{self, read_message_capped};
 use crate::protocol::message;
 use crate::protocol::startup::StartupMessage;
 use crate::scram::{ScramKeys, ScramSecretStore, ScramSha256, StaticSecretStore};
@@ -106,10 +107,14 @@ impl StaticPasswordValidator {
 impl PasswordValidator for StaticPasswordValidator {
     async fn validate(&self, ctx: &AuthContext<'_>, password: &[u8]) -> Result<bool, BoxError> {
         let user = ctx.startup.user().unwrap_or_default();
-        Ok(self
-            .credentials
-            .get(user)
-            .is_some_and(|expected| expected.as_bytes() == password))
+        // Constant-time compare so a same-length wrong guess can't be told from a
+        // right one by timing (mirroring the SCRAM path, which already uses
+        // `ConstantTimeEq`). Length differences still leak via timing, which is
+        // acceptable for this in-memory validator.
+        Ok(match self.credentials.get(user) {
+            Some(expected) => expected.as_bytes().ct_eq(password).into(),
+            None => false,
+        })
     }
 }
 
@@ -142,7 +147,7 @@ impl<V: PasswordValidator> Authenticator for CleartextPassword<V> {
             .await?;
         client.flush().await?;
 
-        let msg = read_message(client).await?;
+        let msg = read_message_capped(client, codec::MAX_AUTH_MESSAGE_LEN).await?;
         if msg.tag() != codec::PASSWORD_MESSAGE {
             return Err(format!(
                 "expected PasswordMessage, got tag {:?}",

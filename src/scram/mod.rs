@@ -31,7 +31,7 @@ use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::auth::{AuthContext, Authenticator, BackendAuth, ClientAuth};
-use crate::protocol::codec::{self, read_message};
+use crate::protocol::codec::{self, read_message_capped};
 use crate::protocol::message;
 
 const MECHANISM: &str = "SCRAM-SHA-256";
@@ -80,7 +80,7 @@ impl<S: ScramSecretStore> Authenticator for ScramSha256<S> {
         client.flush().await?;
 
         // 2. SASLInitialResponse: mechanism + client-first-message.
-        let initial = read_message(client).await?;
+        let initial = read_message_capped(client, codec::MAX_AUTH_MESSAGE_LEN).await?;
         if initial.tag() != codec::PASSWORD_MESSAGE {
             return Err(format!("scram: expected SASL response, got tag {:?}", initial.tag() as char).into());
         }
@@ -107,7 +107,7 @@ impl<S: ScramSecretStore> Authenticator for ScramSha256<S> {
         client.flush().await?;
 
         // 4. SASLResponse: client-final-message.
-        let response = read_message(client).await?;
+        let response = read_message_capped(client, codec::MAX_AUTH_MESSAGE_LEN).await?;
         if response.tag() != codec::PASSWORD_MESSAGE {
             return Err(format!("scram: expected SASL response, got tag {:?}", response.tag() as char).into());
         }

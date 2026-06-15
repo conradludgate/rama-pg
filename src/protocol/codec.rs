@@ -41,6 +41,13 @@ pub const TERMINATE: u8 = b'X';
 /// Sanity cap on an incoming frame: 1 GiB. Guards against a hostile length.
 const MAX_MESSAGE_LEN: i32 = 1 << 30;
 
+/// Tight cap for messages read during the pre-auth phase (the SASL / password
+/// exchange). A cleartext password, a JWT-as-password, or any SCRAM message all
+/// fit comfortably in 64 KiB, so bounding the length here stops an
+/// *unauthenticated* peer from using a 5-byte header to force the full 1 GiB
+/// up-front allocation that the regular [`MAX_MESSAGE_LEN`] would permit.
+pub const MAX_AUTH_MESSAGE_LEN: i32 = 1 << 16;
+
 /// A complete tagged frame, retained verbatim for opaque forwarding.
 #[derive(Debug, Clone)]
 pub struct RawMessage {
@@ -71,13 +78,27 @@ impl RawMessage {
 }
 
 /// Read one tagged message from `reader`, returning the complete frame.
+///
+/// Uses the regular [`MAX_MESSAGE_LEN`] cap; for streams from an
+/// *unauthenticated* peer prefer [`read_message_capped`] with a tight bound.
 pub async fn read_message<R>(reader: &mut R) -> io::Result<RawMessage>
+where
+    R: AsyncRead + Unpin,
+{
+    read_message_capped(reader, MAX_MESSAGE_LEN).await
+}
+
+/// Like [`read_message`], but rejects (rather than allocating for) any frame
+/// whose declared length exceeds `max_len`. Pass a tight `max_len` such as
+/// [`MAX_AUTH_MESSAGE_LEN`] on the pre-auth path so a hostile length can't drive
+/// a large up-front allocation before the peer has authenticated.
+pub async fn read_message_capped<R>(reader: &mut R, max_len: i32) -> io::Result<RawMessage>
 where
     R: AsyncRead + Unpin,
 {
     let tag = reader.read_u8().await?;
     let len = reader.read_i32().await?;
-    if !(4..=MAX_MESSAGE_LEN).contains(&len) {
+    if !(4..=max_len).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid message length {len} for tag {:?}", tag as char),
@@ -188,6 +209,28 @@ mod tests {
         // tag 'Q', length 3 (< 4).
         let bytes = [QUERY, 0, 0, 0, 3];
         assert!(read_message(&mut &bytes[..]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn capped_read_rejects_oversized_length_without_allocating() {
+        // A 5-byte header declaring a 1 GiB body. Under the auth cap this is
+        // rejected outright rather than triggering a huge up-front allocation,
+        // closing the pre-auth amplification DoS.
+        let bytes = [PASSWORD_MESSAGE, 0x40, 0, 0, 0]; // len = 1 GiB
+        let err = read_message_capped(&mut &bytes[..], MAX_AUTH_MESSAGE_LEN)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn capped_read_accepts_a_small_frame() {
+        let built = frame(PASSWORD_MESSAGE, b"hunter2\0");
+        let msg = read_message_capped(&mut &built[..], MAX_AUTH_MESSAGE_LEN)
+            .await
+            .unwrap();
+        assert_eq!(msg.tag(), PASSWORD_MESSAGE);
+        assert_eq!(msg.payload(), b"hunter2\0");
     }
 
     #[tokio::test]

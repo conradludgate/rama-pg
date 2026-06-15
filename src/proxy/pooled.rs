@@ -101,6 +101,9 @@ async fn relay_pooled<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    // The reset query (e.g. DISCARD ALL) is replayed to a backend before it
+    // returns to the pool; capture it once so each transaction can reuse it.
+    let reset = pool.reset_query().map(<[u8]>::to_vec);
     let mut client = codec::FramedReader::new(stream);
     loop {
         // Idle: wait for the client to begin a transaction/statement.
@@ -112,7 +115,7 @@ where
         }
 
         let lease = pool.lease(startup_frame, user, database).await?;
-        if !run_lease(&mut client, lease, first.as_bytes(), mode).await? {
+        if !run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await? {
             break; // client gone
         }
     }
@@ -131,12 +134,17 @@ where
 /// desynced backend could be re-pooled and leak the previous client's leftover
 /// result frames to the next client of the same `(user, database)`.
 ///
+/// Before a verified-idle checkin, the backend's session state is reset via
+/// `reset` (when set) so non-`LOCAL` `SET`/`PREPARE`/temp-table/`LISTEN` state
+/// can't leak across clients sharing the backend.
+///
 /// Returns `Ok(true)` to keep serving the client, `Ok(false)` once it has gone.
 async fn run_lease<C>(
     client: &mut codec::FramedReader<C>,
     mut lease: Lease,
     first: &[u8],
     mode: PoolMode,
+    reset: Option<&[u8]>,
 ) -> Result<bool, BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -157,8 +165,17 @@ where
                 lease.discard(); // client gone mid-statement
                 return Ok(false);
             }
-            // Verified idle: the only safe point to return the backend.
+            // Verified idle: the only safe point to return the backend. Reset
+            // its session state first so nothing leaks to the next client; a
+            // failed reset just discards the backend (the client keeps serving).
             Ok(Some(b'I')) => {
+                if let Some(reset) = reset
+                    && let Err(err) = lease.reset(reset).await
+                {
+                    tracing::warn!(error = %err, "backend reset failed; discarding");
+                    lease.discard();
+                    return Ok(true);
+                }
                 lease.checkin();
                 return Ok(true);
             }
@@ -197,6 +214,10 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    // A fresh reader per call is safe because Postgres is half-duplex: after a
+    // `ReadyForQuery` the backend is silent until the next query, so this
+    // reader's buffer is always empty at the boundary where we drop it (and
+    // where the reset path below reads directly from the same backend).
     let mut backend = codec::FramedReader::new(backend);
     loop {
         tokio::select! {
