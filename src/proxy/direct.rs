@@ -14,7 +14,7 @@ use crate::cancel::{CancelHandle, Cancellation, UpstreamCancel};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
 use crate::protocol::startup::{CancelKey, ProtocolVersion};
-use crate::route::Router;
+use crate::route::{Backend, Router};
 
 /// `Authentication` sub-type for success (`AuthenticationOk`).
 const AUTH_OK: i32 = 0;
@@ -23,27 +23,35 @@ const AUTH_OK: i32 = 0;
 /// next message is `AuthenticationOk`).
 const AUTH_SASL_FINAL: i32 = 12;
 
-/// Direct 1:1 forwarding: resolve the backend from the SNI, replay the startup,
-/// satisfy backend auth (pass-through / trust / SCRAM reauth), then relay bytes.
-pub struct DirectForwarder {
-    router: Arc<Router>,
+/// Direct 1:1 forwarding: route a client, replay startup, satisfy backend auth,
+/// then relay bytes. The router is a Rama [`Service`] returning the client and
+/// an optional target. It can use startup user/database, SNI and auth metadata.
+pub struct DirectForwarder<R = Arc<Router>> {
+    router: R,
     cancellation: Arc<dyn Cancellation>,
 }
 
-impl DirectForwarder {
-    pub fn new(router: Arc<Router>, cancellation: Arc<dyn Cancellation>) -> Self {
-        Self { router, cancellation }
+impl<R> DirectForwarder<R> {
+    /// Compose a routing service with direct forwarding. `None` rejects the
+    /// client with SQLSTATE 08004; service errors propagate to the caller.
+    pub fn new(router: R, cancellation: Arc<dyn Cancellation>) -> Self {
+        Self {
+            router,
+            cancellation,
+        }
     }
 }
 
-impl<IO> Service<PgClient<IO>> for DirectForwarder
+impl<IO, R> Service<PgClient<IO>> for DirectForwarder<R>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: Service<PgClient<IO>, Output = (PgClient<IO>, Option<Backend>), Error: Into<BoxError>>,
 {
     type Output = ();
     type Error = BoxError;
 
     async fn serve(&self, client: PgClient<IO>) -> Result<(), BoxError> {
+        let (client, backend) = self.router.serve(client).await.map_err(Into::into)?;
         let PgClient {
             mut stream,
             startup,
@@ -55,16 +63,16 @@ where
             auth,
         } = client;
 
-        let Some(backend) = self.router.route(sni.as_deref()) else {
-            tracing::info!(?sni, user = ?startup.user(), "no backend route for SNI");
+        let Some(backend) = backend else {
+            tracing::info!(?sni, user = ?startup.user(), "no backend route for client");
             return reject(
                 &mut stream,
                 "08004",
-                "rama-pg: no backend configured for this server name",
+                "rama-pg: no backend configured for this client",
             )
             .await;
         };
-        let address = backend.address.clone();
+        let address = backend.address;
         tracing::info!(
             ?sni,
             user = ?startup.user(),
@@ -96,14 +104,38 @@ where
         // satisfying the backend's own auth: nothing for trust, SCRAM reauth).
         match auth {
             ClientAuth::PassThrough => {
-                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, true).await?
+                relay_startup(
+                    &mut stream,
+                    &mut upstream,
+                    &address,
+                    &client_key,
+                    &handle,
+                    true,
+                )
+                .await?
             }
             ClientAuth::Terminated(BackendAuth::Trust) => {
-                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, false).await?
+                relay_startup(
+                    &mut stream,
+                    &mut upstream,
+                    &address,
+                    &client_key,
+                    &handle,
+                    false,
+                )
+                .await?
             }
             ClientAuth::Terminated(BackendAuth::Scram(keys)) => {
                 crate::scram::reauth_upstream(&mut upstream, &keys).await?;
-                relay_startup(&mut stream, &mut upstream, &address, &client_key, &handle, false).await?
+                relay_startup(
+                    &mut stream,
+                    &mut upstream,
+                    &address,
+                    &client_key,
+                    &handle,
+                    false,
+                )
+                .await?
             }
         }
 
@@ -175,7 +207,9 @@ where
                             backend: backend_addr.to_owned(),
                             key: CancelKey::from_bytes(Bytes::copy_from_slice(msg.payload())),
                         }));
-                        client.write_all(&message::backend_key_data_raw(key.as_bytes())).await?;
+                        client
+                            .write_all(&message::backend_key_data_raw(key.as_bytes()))
+                            .await?;
                     }
                     None => client.write_all(msg.as_bytes()).await?,
                 }

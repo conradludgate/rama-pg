@@ -1,12 +1,16 @@
-//! SNI-based routing to backend Postgres targets.
+//! Routing authenticated PostgreSQL clients to backend targets.
 //!
-//! Unlike HTTP there is no Host header, and the backend-selecting key (`user` /
-//! `database`) only arrives after TLS. So the proxy routes on the TLS SNI — the
-//! one key available at handshake time — through a static map. This mirrors how
-//! managed Postgres providers route on SNI / endpoint id, minus a control-plane
-//! lookup.
+//! [`Router`] supplies a static SNI map. Custom Rama services can instead use
+//! the full [`PgClient`] startup metadata, authentication outcome and transport.
+//! Routing returns the client with an optional owned target, preserving its I/O
+//! and startup bytes without cloning them across an asynchronous policy lookup.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+
+use rama::Service;
+
+use crate::proxy::PgClient;
 
 /// A backend Postgres target the proxy can forward to.
 #[derive(Debug, Clone)]
@@ -59,6 +63,16 @@ impl Router {
     }
 }
 
+impl<IO: Send + 'static> Service<PgClient<IO>> for Router {
+    type Output = (PgClient<IO>, Option<Backend>);
+    type Error = Infallible;
+
+    async fn serve(&self, client: PgClient<IO>) -> Result<Self::Output, Self::Error> {
+        let backend = self.route(client.sni.as_deref()).cloned();
+        Ok((client, backend))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,7 +83,10 @@ mod tests {
             .with_default(Backend::new("default:5432"))
             .with_route("a.example.com", Backend::new("a:5432"));
 
-        assert_eq!(router.route(Some("a.example.com")).unwrap().address, "a:5432");
+        assert_eq!(
+            router.route(Some("a.example.com")).unwrap().address,
+            "a:5432"
+        );
         assert_eq!(
             router.route(Some("other.example.com")).unwrap().address,
             "default:5432"
