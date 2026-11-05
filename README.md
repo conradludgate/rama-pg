@@ -144,6 +144,40 @@ The service owns the client while routing; cancellation/drop releases that
 connection instead of leaving detached routing work. Layers can surround the
 routing service just as they surround the forwarder.
 
+### Choose backend transport and cancellation together
+
+`DirectForwarder::with_connector` accepts a Rama `Service<Target>` returning
+`BackendConnection<IO, Cancel>`. With a custom connector, the routing service can
+return any owned target type, including a request carrying tenant-specific
+connection policy. No extra routing trait or startup-parameter copy is required.
+
+The result contains `conn` and a cloneable cancellation service over `CancelKey`.
+The forwarder passes the real backend key to that service when a proxy-issued
+key is cancelled. Supply a cancellation path to the same established upstream;
+for TLS, Unix sockets, tunnels or custom routing this can differ from the normal
+connection path. Cloning the service must preserve that destination/context.
+
+The default `TcpBackendConnector` wraps Rama's non-HTTP `default_tcp_connect`
+primitive and pins cancellation to the winning connected socket address. It does
+not resolve the original route again. Pass an executor through its `new` method
+when sharing Rama's shutdown lifecycle. Routing/connector/cancellation services
+can each carry their own layers and timeout policy.
+
+```rust
+use rama_pg::connect::BackendConnection;
+
+let connector = service_fn(|target: TenantTarget| async move {
+    let (conn, cancellation) = establish_tenant_backend(target).await?;
+    Ok::<_, MyError>(BackendConnection { conn, cancellation })
+});
+let forwarder = DirectForwarder::new(routes, cancellation_registry)
+    .with_connector(connector);
+```
+
+`None` routes are rejected before connecting. Establishment errors produce
+SQLSTATE `08006`. Backend authentication and opaque byte relay remain in the
+forwarder after the connector returns the transport.
+
 ### Terminate cleartext password auth
 
 Swap the authenticator. The proxy challenges the client for a cleartext password

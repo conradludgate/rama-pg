@@ -5,16 +5,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rama::Service;
 use rama::error::BoxError;
-use rama::tcp::TokioTcpStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject};
 use crate::auth::{BackendAuth, ClientAuth};
-use crate::cancel::{CancelHandle, Cancellation, UpstreamCancel};
+use crate::cancel::{CancelHandle, Cancellation};
+use crate::connect::{BackendCancelTarget, BackendConnection, TcpBackendConnector};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::message;
 use crate::protocol::startup::{CancelKey, ProtocolVersion};
-use crate::route::{Backend, Router};
+use crate::route::Router;
 
 /// `Authentication` sub-type for success (`AuthenticationOk`).
 const AUTH_OK: i32 = 0;
@@ -26,8 +26,9 @@ const AUTH_SASL_FINAL: i32 = 12;
 /// Direct 1:1 forwarding: route a client, replay startup, satisfy backend auth,
 /// then relay bytes. The router is a Rama [`Service`] returning the client and
 /// an optional target. It can use startup user/database, SNI and auth metadata.
-pub struct DirectForwarder<R = Arc<Router>> {
+pub struct DirectForwarder<R = Arc<Router>, C = TcpBackendConnector> {
     router: R,
+    connector: C,
     cancellation: Arc<dyn Cancellation>,
 }
 
@@ -37,15 +38,33 @@ impl<R> DirectForwarder<R> {
     pub fn new(router: R, cancellation: Arc<dyn Cancellation>) -> Self {
         Self {
             router,
+            connector: TcpBackendConnector::default(),
             cancellation,
         }
     }
 }
 
-impl<IO, R> Service<PgClient<IO>> for DirectForwarder<R>
+impl<R, C> DirectForwarder<R, C> {
+    /// Supply a backend establishment service. It returns the stream and the
+    /// cloneable cancellation service for the actual selected backend together.
+    /// Connection failures return SQLSTATE 08006 to the client.
+    pub fn with_connector<N>(self, connector: N) -> DirectForwarder<R, N> {
+        DirectForwarder {
+            router: self.router,
+            connector,
+            cancellation: self.cancellation,
+        }
+    }
+}
+
+impl<IO, R, C, T, B, K> Service<PgClient<IO>> for DirectForwarder<R, C>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    R: Service<PgClient<IO>, Output = (PgClient<IO>, Option<Backend>), Error: Into<BoxError>>,
+    R: Service<PgClient<IO>, Output = (PgClient<IO>, Option<T>), Error: Into<BoxError>>,
+    C: Service<T, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    T: Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>> + Clone,
 {
     type Output = ();
     type Error = BoxError;
@@ -72,19 +91,21 @@ where
             )
             .await;
         };
-        let address = backend.address;
         tracing::info!(
             ?sni,
             user = ?startup.user(),
             database = ?startup.database(),
-            backend = %address,
             "routing connection",
         );
 
-        let mut upstream = match TokioTcpStream::connect(&address).await {
-            Ok(upstream) => upstream,
+        let BackendConnection {
+            conn: mut upstream,
+            cancellation: backend_cancellation,
+        } = match self.connector.serve(backend).await {
+            Ok(connection) => connection,
             Err(err) => {
-                tracing::error!(%address, %err, "failed to connect to backend");
+                let err: BoxError = err.into();
+                tracing::error!(%err, "failed to connect to backend");
                 return reject(&mut stream, "08006", "rama-pg: could not reach backend").await;
             }
         };
@@ -107,7 +128,7 @@ where
                 relay_startup(
                     &mut stream,
                     &mut upstream,
-                    &address,
+                    &backend_cancellation,
                     &client_key,
                     &handle,
                     true,
@@ -118,7 +139,7 @@ where
                 relay_startup(
                     &mut stream,
                     &mut upstream,
-                    &address,
+                    &backend_cancellation,
                     &client_key,
                     &handle,
                     false,
@@ -130,7 +151,7 @@ where
                 relay_startup(
                     &mut stream,
                     &mut upstream,
-                    &address,
+                    &backend_cancellation,
                     &client_key,
                     &handle,
                     false,
@@ -159,10 +180,10 @@ where
 /// `client_key` is the cancel key to advertise (or `None` to pass the backend's
 /// own through); when set, the backend's captured key is recorded on `handle` so
 /// an incoming `CancelRequest` can be routed to it.
-async fn relay_startup<C, B>(
+async fn relay_startup<C, B, K>(
     client: &mut C,
     backend: &mut B,
-    backend_addr: &str,
+    backend_cancellation: &K,
     client_key: &Option<CancelKey>,
     handle: &CancelHandle,
     interactive_auth: bool,
@@ -170,6 +191,7 @@ async fn relay_startup<C, B>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>> + Clone,
 {
     loop {
         let msg = read_message(backend).await?;
@@ -203,8 +225,8 @@ where
                 // cancellation issued none).
                 match client_key {
                     Some(key) => {
-                        handle.set(Arc::new(UpstreamCancel {
-                            backend: backend_addr.to_owned(),
+                        handle.set(Arc::new(BackendCancelTarget {
+                            service: backend_cancellation.clone(),
                             key: CancelKey::from_bytes(Bytes::copy_from_slice(msg.payload())),
                         }));
                         client
