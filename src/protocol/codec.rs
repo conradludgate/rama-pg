@@ -10,7 +10,7 @@
 use std::io;
 
 use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Backend → frontend tags.
 /// `AuthenticationXxx` (the sub-type is the first Int32 of the payload).
@@ -50,6 +50,86 @@ const MAX_MESSAGE_LEN: i32 = 1 << 30;
 /// *unauthenticated* peer from using a 5-byte header to force the full 1 GiB
 /// up-front allocation that the regular [`MAX_MESSAGE_LEN`] would permit.
 pub const MAX_AUTH_MESSAGE_LEN: i32 = 1 << 16;
+
+/// A validated five-byte tagged-message header, without a buffered body.
+///
+/// Inspect the tag to decide whether to decode a body or stream it unchanged.
+/// The encoded length includes its four bytes, but excludes the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageHeader([u8; 5]);
+
+impl MessageHeader {
+    fn parse(bytes: [u8; 5], max_len: i32) -> io::Result<Self> {
+        let len = i32::from_be_bytes(bytes[1..].try_into().expect("four length bytes"));
+        if !(4..=max_len).contains(&len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid message length {len} for tag {:?}",
+                    bytes[0] as char
+                ),
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn tag(self) -> u8 {
+        self.0[0]
+    }
+
+    /// Number of body bytes following this header.
+    pub fn body_len(self) -> usize {
+        (i32::from_be_bytes(self.0[1..].try_into().expect("four length bytes")) - 4) as usize
+    }
+
+    /// The header as received, ready for verbatim forwarding.
+    pub fn as_bytes(&self) -> &[u8; 5] {
+        &self.0
+    }
+
+    /// Copy exactly this body's bytes using caller-owned scratch space.
+    ///
+    /// Does not allocate, flush, or consume the following frame. Empty scratch
+    /// space is valid only for an empty body. This operation is not cancel-safe;
+    /// after interruption or an I/O error, do not resume parsing this stream.
+    pub async fn copy_body_to<R, W>(
+        self,
+        reader: &mut R,
+        writer: &mut W,
+        scratch: &mut [u8],
+    ) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut remaining = self.body_len();
+        if remaining != 0 && scratch.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty body-copy buffer",
+            ));
+        }
+        while remaining != 0 {
+            let chunk = remaining.min(scratch.len());
+            reader.read_exact(&mut scratch[..chunk]).await?;
+            writer.write_all(&scratch[..chunk]).await?;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
+}
+
+/// Read and validate a header before reading or allocating for its body.
+/// `max_len` bounds the encoded length (including the four length bytes).
+/// This operation is not cancel-safe; use [`FramedReader`] in `select!`.
+pub async fn read_header<R>(reader: &mut R, max_len: i32) -> io::Result<MessageHeader>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).await?;
+    MessageHeader::parse(bytes, max_len)
+}
 
 /// A complete tagged frame, retained verbatim for opaque forwarding.
 #[derive(Debug, Clone)]
@@ -94,26 +174,24 @@ where
 /// Like [`read_message`], but rejects (rather than allocating for) any frame
 /// whose declared length exceeds `max_len`. Pass a tight `max_len` such as
 /// [`MAX_AUTH_MESSAGE_LEN`] on the pre-auth path so a hostile length can't drive
-/// a large up-front allocation before the peer has authenticated.
+/// a large up-front allocation before the peer has authenticated. Body storage
+/// grows with received bytes, rather than the declared length. Not cancel-safe.
 pub async fn read_message_capped<R>(reader: &mut R, max_len: i32) -> io::Result<RawMessage>
 where
     R: AsyncRead + Unpin,
 {
-    let tag = reader.read_u8().await?;
-    let len = reader.read_i32().await?;
-    if !(4..=max_len).contains(&len) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid message length {len} for tag {:?}", tag as char),
-        ));
+    let header = read_header(reader, max_len).await?;
+    let mut frame = BytesMut::from(header.as_bytes().as_slice());
+    let total = 5 + header.body_len();
+    while frame.len() < total {
+        let remaining = (total - frame.len()) as u64;
+        if (&mut *reader).take(remaining).read_buf(&mut frame).await? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stream ended mid-message",
+            ));
+        }
     }
-
-    // Total frame = tag (1) + len (which already counts the 4 length bytes).
-    let mut frame = BytesMut::with_capacity(len as usize + 1);
-    frame.put_u8(tag);
-    frame.put_i32(len);
-    frame.resize(len as usize + 1, 0);
-    reader.read_exact(&mut frame[5..]).await?;
 
     Ok(RawMessage { frame })
 }
@@ -138,13 +216,22 @@ pub fn frame(tag: u8, body: &[u8]) -> BytesMut {
 pub struct FramedReader<R> {
     inner: R,
     buf: BytesMut,
+    max_len: i32,
 }
 
 impl<R: AsyncRead + Unpin> FramedReader<R> {
     pub fn new(inner: R) -> Self {
+        Self::with_max_len(inner, MAX_MESSAGE_LEN)
+    }
+
+    /// Set the maximum encoded message length, including its four length bytes.
+    /// Headers are validated before reading body bytes. Storage grows only as
+    /// bytes arrive, and reads never consume bytes belonging to the next frame.
+    pub fn with_max_len(inner: R, max_len: i32) -> Self {
         Self {
             inner,
             buf: BytesMut::new(),
+            max_len,
         }
     }
 
@@ -156,10 +243,33 @@ impl<R: AsyncRead + Unpin> FramedReader<R> {
     /// Read one frame, `None` at a clean end of stream. Cancel-safe.
     pub async fn read_frame(&mut self) -> io::Result<Option<RawMessage>> {
         loop {
-            if let Some(frame) = take_frame(&mut self.buf)? {
-                return Ok(Some(frame));
-            }
-            if self.inner.read_buf(&mut self.buf).await? == 0 {
+            let missing = if self.buf.len() < 5 {
+                5 - self.buf.len()
+            } else {
+                let header = MessageHeader::parse(
+                    self.buf[..5]
+                        .try_into()
+                        .expect("five buffered header bytes"),
+                    self.max_len,
+                )?;
+                let total = 5 + header.body_len();
+                if self.buf.len() == total {
+                    return Ok(Some(RawMessage {
+                        frame: self.buf.split_to(total),
+                    }));
+                }
+                total - self.buf.len()
+            };
+            // Reclaim/reuse a split buffer before reading, rather than issuing
+            // extra reads into small leftover fragments. A declared large body
+            // can reserve only one bounded chunk before any bytes arrive.
+            self.buf.reserve(missing.min(8 * 1024));
+            if (&mut self.inner)
+                .take(missing as u64)
+                .read_buf(&mut self.buf)
+                .await?
+                == 0
+            {
                 return if self.buf.is_empty() {
                     Ok(None)
                 } else {
@@ -171,27 +281,6 @@ impl<R: AsyncRead + Unpin> FramedReader<R> {
             }
         }
     }
-}
-
-/// Split off a complete frame from `buf` if one is fully buffered.
-fn take_frame(buf: &mut BytesMut) -> io::Result<Option<RawMessage>> {
-    if buf.len() < 5 {
-        return Ok(None);
-    }
-    let len = i32::from_be_bytes(buf[1..5].try_into().unwrap());
-    if !(4..=MAX_MESSAGE_LEN).contains(&len) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid message length {len} for tag {:?}", buf[0] as char),
-        ));
-    }
-    let total = 1 + len as usize;
-    if buf.len() < total {
-        return Ok(None);
-    }
-    Ok(Some(RawMessage {
-        frame: buf.split_to(total),
-    }))
 }
 
 #[cfg(test)]
