@@ -296,6 +296,30 @@ let pool = BackendPool::with_credentials(
 );
 ```
 
+To supply your own backend transport, use `BackendPool::with_connector` with
+the same credentials and a `Service<Backend>` returning `BackendConnection`.
+Its stream must implement Rama's `ExtensionsRef` as well as bidirectional I/O;
+the pool retains the concrete stream without boxing. Compose the resulting
+`PooledForwarder::new(pool, cancellation)` through `PgSession` or
+`PgProxy::with_forwarder`:
+
+```rust
+let pool = BackendPool::with_connector(replicas, 8, PoolMode::Transaction, creds, connector);
+let forwarder = rama_pg::proxy::PooledForwarder::new(pool, cancellation);
+```
+
+The pool still chooses a configured replica and performs PostgreSQL startup,
+backend authentication and reset. The connector establishes its transport and
+returns the matching cancellation service, as in direct mode. The pool retains
+one shared cancellation target per backend; neither the connector nor its
+cancellation service needs to implement `Clone`.
+
+When using `Lease` directly, call `checkin` only after draining the response to
+idle and applying the required reset. Dropping it, including task cancellation,
+discards the connection. `cancel_target` returns `Option<Arc<dyn CancelTarget>>`
+instead of an address-based `UpstreamCancel`, so it also works with custom
+transports.
+
 ### Answer queries in-proxy with no backend
 
 Implement `QueryHandler` for a "virtual Postgres" — the proxy answers queries
