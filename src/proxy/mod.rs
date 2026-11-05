@@ -51,8 +51,8 @@ use crate::route::Router;
 /// The shared front matter — TLS, `StartupMessage`, and auth — has already
 /// happened; a *forwarder* takes it from here. Forwarders are plain
 /// [`rama::Service`]s over a `PgClient`, so each mode (direct, pooled, custom)
-/// is just a `Service` impl and a new one is "write a `Service`", selected at
-/// construction via [`rama::service::BoxService`].
+/// is just a `Service` impl. Caller-supplied forwarders retain their concrete
+/// service type; runtime mode selection can use [`rama::service::BoxService`].
 pub struct PgClient<IO> {
     /// The (TLS) client stream.
     pub stream: IO,
@@ -68,12 +68,13 @@ pub struct PgClient<IO> {
     pub auth: ClientAuth,
 }
 
-/// A boxed forwarding leaf operating on the proxy's concrete client stream.
+/// A boxed forwarding leaf used by the built-in runtime mode selector.
 pub type Forwarder = BoxService<PgClient<TlsStream<TcpStream>>, (), BoxError>;
 
-/// Top-level proxy service operating on a raw [`TcpStream`].
-pub struct PgProxy<A> {
-    tls: TlsAcceptorService<PgSession<A>>,
+/// Top-level proxy service operating on a raw [`TcpStream`]. Caller-supplied
+/// forwarders retain their concrete type, including any composed Rama layers.
+pub struct PgProxy<A, F = Forwarder> {
+    tls: TlsAcceptorService<PgSession<A, F>>,
     /// Handles `CancelRequest`s that arrive in the clear (the traditional libpq
     /// cancel path). Over-TLS cancels are handled by [`PgSession`].
     cancellation: Arc<dyn Cancellation>,
@@ -106,22 +107,23 @@ impl<A: Authenticator> PgProxy<A> {
     /// Build a proxy with a caller-supplied forwarding [`Service`] — the
     /// composability seam for new modes beyond the built-in three. `cancellation`
     /// handles incoming `CancelRequest`s; the forwarder is responsible for
-    /// issuing keys (see [`crate::cancel`]).
+    /// issuing keys (see [`crate::cancel`]). The forwarder's concrete type is
+    /// preserved; use [`Service::boxed`] when dynamic dispatch is desired.
     pub fn with_forwarder<F>(
         tls: TlsAcceptorData,
         auth: Arc<A>,
         forwarder: F,
         cancellation: Arc<dyn Cancellation>,
-    ) -> Self
+    ) -> PgProxy<A, F>
     where
-        F: Service<PgClient<TlsStream<TcpStream>>, Output = (), Error = BoxError>,
+        F: Service<PgClient<TlsStream<TcpStream>>, Output = (), Error: Into<BoxError>>,
     {
         // `store_client_hello = true` so the SNI is captured into the TLS
         // stream's extensions for routing.
-        Self {
+        PgProxy {
             tls: TlsAcceptorService::new(
                 tls,
-                PgSession::new(auth, forwarder.boxed(), cancellation.clone()),
+                PgSession::new(auth, forwarder, cancellation.clone()),
                 true,
             ),
             cancellation,
@@ -129,9 +131,10 @@ impl<A: Authenticator> PgProxy<A> {
     }
 }
 
-impl<A> Service<TcpStream> for PgProxy<A>
+impl<A, F> Service<TcpStream> for PgProxy<A, F>
 where
     A: Authenticator,
+    F: Service<PgClient<TlsStream<TcpStream>>, Output = (), Error: Into<BoxError>>,
 {
     type Output = ();
     type Error = BoxError;
@@ -192,17 +195,24 @@ where
     }
 }
 
-/// Runs the shared post-TLS front matter — read the `StartupMessage`, capture
-/// the SNI, authenticate — then hands an authenticated [`PgClient`] to the
-/// forwarding leaf.
-pub struct PgSession<A> {
+/// Read startup, capture transport metadata, authenticate, and delegate to a
+/// forwarding [`Service`].
+///
+/// This service accepts any bidirectional I/O carrying Rama extensions. It can
+/// sit behind a caller's TLS acceptor, Unix socket listener, or another transport
+/// layer. SNI is read from [`SecureTransport`] when present. Transport security
+/// is the caller's responsibility: unlike [`PgProxy`], this layer does not
+/// negotiate or require TLS. Password authenticators require a protected stream.
+pub struct PgSession<A, F = Forwarder> {
     auth: Arc<A>,
-    forwarder: Forwarder,
+    forwarder: F,
     cancellation: Arc<dyn Cancellation>,
 }
 
-impl<A> PgSession<A> {
-    fn new(auth: Arc<A>, forwarder: Forwarder, cancellation: Arc<dyn Cancellation>) -> Self {
+impl<A, F> PgSession<A, F> {
+    /// Compose startup/authentication with a forwarding service. The concrete
+    /// service and its Rama layers are retained without mandatory boxing.
+    pub fn new(auth: Arc<A>, forwarder: F, cancellation: Arc<dyn Cancellation>) -> Self {
         Self {
             auth,
             forwarder,
@@ -211,14 +221,16 @@ impl<A> PgSession<A> {
     }
 }
 
-impl<A> Service<TlsStream<TcpStream>> for PgSession<A>
+impl<A, F, IO> Service<IO> for PgSession<A, F>
 where
     A: Authenticator,
+    IO: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + ExtensionsRef + 'static,
+    F: Service<PgClient<IO>, Output = (), Error: Into<BoxError>>,
 {
     type Output = ();
     type Error = BoxError;
 
-    async fn serve(&self, mut stream: TlsStream<TcpStream>) -> Result<(), BoxError> {
+    async fn serve(&self, mut stream: IO) -> Result<(), BoxError> {
         // The TLS acceptor stored the ClientHello (and thus SNI) in the stream's
         // extensions.
         let sni = stream
@@ -229,7 +241,8 @@ where
             .map(|host| host.to_string());
 
         // The parsed StartupMessage keeps its raw frame for verbatim replay.
-        let startup = match StartupRequest::parse(read_startup_frame(&mut stream).await?.freeze())? {
+        let startup = match StartupRequest::parse(read_startup_frame(&mut stream).await?.freeze())?
+        {
             StartupRequest::Startup(msg) => msg,
             StartupRequest::Cancel(req) => {
                 // Modern libpq (PG 17+) sends the CancelRequest over TLS, honoring
@@ -243,14 +256,27 @@ where
             }
             other => {
                 tracing::warn!(?other, "unexpected message after TLS handshake");
-                return reject(&mut stream, "08P01", "unexpected message after TLS handshake").await;
+                return reject(
+                    &mut stream,
+                    "08P01",
+                    "unexpected message after TLS handshake",
+                )
+                .await;
             }
         };
 
         // Only protocol major 3 exists.
         if startup.protocol_major() != 3 {
-            tracing::warn!(version = startup.protocol_version().code(), "unsupported protocol major version");
-            return reject(&mut stream, "0A000", "rama-pg: unsupported protocol major version").await;
+            tracing::warn!(
+                version = startup.protocol_version().code(),
+                "unsupported protocol major version"
+            );
+            return reject(
+                &mut stream,
+                "0A000",
+                "rama-pg: unsupported protocol major version",
+            )
+            .await;
         }
         // When the proxy terminates auth it is the negotiation authority: tell the
         // client about a minor-version downgrade or unrecognized `_pq_` options
@@ -260,7 +286,11 @@ where
         if self.auth.terminates() {
             let unsupported: Vec<&str> = startup.pq_options().collect();
             if negotiated != startup.protocol_version() || !unsupported.is_empty() {
-                tracing::info!(requested = startup.protocol_version().code(), negotiated = negotiated.code(), "negotiating protocol version");
+                tracing::info!(
+                    requested = startup.protocol_version().code(),
+                    negotiated = negotiated.code(),
+                    "negotiating protocol version"
+                );
                 stream
                     .write_all(&negotiate_protocol_version(negotiated, &unsupported))
                     .await?;
@@ -285,6 +315,7 @@ where
                 auth,
             })
             .await
+            .map_err(Into::into)
     }
 }
 

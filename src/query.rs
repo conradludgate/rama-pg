@@ -104,6 +104,7 @@ impl QueryResponse {
 }
 
 /// A pluggable, async handler that answers simple-protocol queries in-proxy.
+#[expect(clippy::double_must_use, reason = "async-trait adds must_use to already must-use boxed futures")]
 #[async_trait]
 pub trait QueryHandler: Send + Sync + 'static {
     async fn handle(&self, ctx: QueryContext<'_>, sql: &str) -> QueryResponse;
