@@ -66,13 +66,14 @@ startup, rather than decoding every message.
 
 These are follow-ups, not claims that the first integration implements them:
 
-1. **Rama-native backend establishment.** Direct forwarding still uses a fixed
-   SNI policy by default and a Tokio TCP dial. DirectForwarder now accepts a
-   routing Service<PgClient<IO>>; custom policies can use all startup metadata
-   without cloning it. Next separate connection
-   establishment using Rama services/connectors. Allow startup metadata to
-   select a target and caller layers to configure DNS, timeouts, backend TLS and
-   observability. Cancellation must follow the actual selected backend.
+1. **Rama-native backend establishment.** Direct forwarding now accepts routing
+   and establishment services. Routes own/return PgClient; custom connectors
+   accept any owned target and return BackendConnection with its stream and a
+   cloneable cancellation service. The TCP default uses Rama's non-HTTP connect
+   primitive and pins cancellation to the connected peer. Custom policies can
+   layer DNS/TLS/deadlines and carry tenant-specific target metadata. Next apply
+   this establishment boundary to pooled backends without folding pool lifecycle
+   or PgBouncer configuration into the transport service.
 2. **Layered resource policy.** Thread application-selected frame budgets through
    built-in forwarders/authentication. Use Rama layers for concurrency and time
    budgets; account separately for session and pool state. Preserve opaque

@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod cancel;
+pub mod connect;
 pub mod pool;
 pub mod protocol;
 pub mod proxy;
