@@ -45,6 +45,7 @@ use crate::protocol::startup::{CancelKey, ProtocolVersion, cancel_request_frame}
 /// The built-ins are [`UpstreamCancel`] (forward a `CancelRequest` to a backend)
 /// and [`TokenCancel`] (fire a token, for in-proxy queries); implement it for a
 /// new cancellation mechanism — the registry just calls `cancel`.
+#[expect(clippy::double_must_use, reason = "async-trait adds must_use to already must-use boxed futures")]
 #[async_trait]
 pub trait CancelTarget: std::fmt::Debug + Send + Sync + 'static {
     /// Perform the cancellation (dial a backend, fire a token, …). Best-effort.
@@ -154,6 +155,7 @@ impl std::fmt::Debug for CancelHandle {
 }
 
 /// Pluggable query-cancellation handling (see the module docs).
+#[expect(clippy::double_must_use, reason = "async-trait adds must_use to already must-use boxed futures")]
 #[async_trait]
 pub trait Cancellation: Send + Sync + 'static {
     /// Begin a client cancel session for a client on `protocol_version` (so the

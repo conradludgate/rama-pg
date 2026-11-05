@@ -223,6 +223,7 @@ fn auth_subtype(msg: &codec::RawMessage) -> i32 {
 /// Supplies the password the pool uses to authenticate to a backend as a role.
 /// The pool connects to backends over plaintext TCP and may be challenged for a
 /// cleartext or SCRAM-SHA-256 password; returning `None` means a trust backend.
+#[expect(clippy::double_must_use, reason = "async-trait adds must_use to already must-use boxed futures")]
 #[async_trait]
 pub trait BackendCredentials: Send + Sync + 'static {
     async fn password(&self, user: &str, database: &str) -> Result<Option<String>, BoxError>;

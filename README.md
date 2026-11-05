@@ -94,6 +94,25 @@ in-proxy query mode by changing the values you pass to `PgProxy`.
 
 ---
 
+## Compose the session layer directly
+
+`PgProxy` provides the standard PostgreSQL TLS negotiation entry point. For a
+custom transport or TLS stack, compose the public `PgSession::new(auth,
+forwarder, cancellation)` service behind your own acceptor instead. It accepts
+bidirectional I/O implementing Rama's `ExtensionsRef`, reads startup/authentication,
+and passes a `PgClient<IO>` to your forwarding service. TLS SNI is taken from the
+transport's `SecureTransport` extension when available.
+
+The caller controls transport security at this boundary: `PgSession` itself does
+not negotiate or require TLS. Put password authenticators behind a protected
+transport. `PgProxy` retains its TLS-required behavior.
+
+Both `PgSession` and `PgProxy::with_forwarder` retain the concrete forwarder and
+its Rama layers. Forwarder errors may be any type convertible to `BoxError`;
+boxing is optional. PgBouncer's configuration and policies remain in the showcase.
+
+---
+
 ## How-to guides
 
 Each guide changes one input to the `PgProxy` from the tutorial. They cover the
