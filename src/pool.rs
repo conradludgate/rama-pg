@@ -5,10 +5,9 @@
 //! ([`rama::net::client::ConnectorService`]) establishes a fresh backend, and
 //! rama's [`PooledConnector`] + [`LruDropPool`] reuse connections keyed by a
 //! [`ReqToConnID`] (here `(user, database)`). A checked-out connection is a
-//! [`LeasedConnection`] that returns to the pool on `Drop` — which lines up with
-//! transaction-boundary semantics: hold the lease for one transaction, drop it
-//! at `ReadyForQuery` idle to return it, or [`Lease::discard`] a connection left
-//! mid-transaction.
+//! [`LeasedConnection`]. The PostgreSQL [`Lease`] discards on drop; only an
+//! explicit [`Lease::checkin`] returns a verified-idle connection to the pool.
+//! Cancellation and unwinding must not return a partially used stream.
 //!
 //! Replica sharding: the pool round-robins each transaction across a list of
 //! equivalent replica addresses (read load-balancing — no primary/replica split,
@@ -34,7 +33,9 @@ use rama::Service;
 use rama::error::BoxError;
 use rama::extensions::{Extension, Extensions, ExtensionsRef};
 use rama::net::client::EstablishedClientConnection;
-use rama::net::client::pool::{ConnID, LeasedConnection, LruDropPool, PooledConnector, ReqToConnID};
+use rama::net::client::pool::{
+    ConnID, LeasedConnection, LruDropPool, PooledConnector, ReqToConnID,
+};
 use rama::tcp::{TcpStream, TokioTcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -150,7 +151,8 @@ impl Service<BackendRequest> for PgConnector {
                     AUTH_CLEARTEXT_PASSWORD => {
                         let mut body = self.backend_password(&req).await?.into_bytes();
                         body.push(0);
-                        conn.write_all(&codec::frame(codec::PASSWORD_MESSAGE, &body)).await?;
+                        conn.write_all(&codec::frame(codec::PASSWORD_MESSAGE, &body))
+                            .await?;
                         conn.flush().await?;
                     }
                     AUTH_SASL => {
@@ -223,7 +225,10 @@ fn auth_subtype(msg: &codec::RawMessage) -> i32 {
 /// Supplies the password the pool uses to authenticate to a backend as a role.
 /// The pool connects to backends over plaintext TCP and may be challenged for a
 /// cleartext or SCRAM-SHA-256 password; returning `None` means a trust backend.
-#[expect(clippy::double_must_use, reason = "async-trait adds must_use to already must-use boxed futures")]
+#[expect(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to already must-use boxed futures"
+)]
 #[async_trait]
 pub trait BackendCredentials: Send + Sync + 'static {
     async fn password(&self, user: &str, database: &str) -> Result<Option<String>, BoxError>;
@@ -330,7 +335,10 @@ impl BackendPool {
         mode: PoolMode,
         credentials: Arc<dyn BackendCredentials>,
     ) -> Arc<Self> {
-        assert!(!replicas.is_empty(), "backend pool needs at least one replica");
+        assert!(
+            !replicas.is_empty(),
+            "backend pool needs at least one replica"
+        );
         let max = max_size.max(1);
         let pool = LruDropPool::try_new(max, max)
             .expect("valid pool size")
@@ -413,22 +421,33 @@ impl BackendPool {
         };
         let established = self.connector.serve(req).await?;
         Ok(Lease {
-            conn: established.conn,
+            conn: Some(established.conn),
         })
     }
 }
 
 /// A backend connection leased for one transaction. It is an opaque
 /// `AsyncRead`/`AsyncWrite` stream; [`checkin`](Self::checkin) returns it to the
-/// pool, [`discard`](Self::discard) drops it.
+/// pool, [`discard`](Self::discard) drops it. Dropping a lease without checkin
+/// also discards it, including task cancellation and unwinding.
 pub struct Lease {
-    conn: LeasedConnection<PooledStream, PgConnId>,
+    // Present while the lease can be borrowed. Taken only when checkin or Drop
+    // consumes its ownership, preventing the native lease from auto-repooling.
+    conn: Option<LeasedConnection<PooledStream, PgConnId>>,
 }
 
 impl Lease {
+    fn connection(&self) -> &LeasedConnection<PooledStream, PgConnId> {
+        self.conn.as_ref().expect("live lease owns its connection")
+    }
+
+    fn connection_mut(&mut self) -> &mut LeasedConnection<PooledStream, PgConnId> {
+        self.conn.as_mut().expect("live lease owns its connection")
+    }
+
     /// The backend's captured `ParameterStatus` frames, to replay to the client.
     pub fn params(&self) -> Vec<BytesMut> {
-        self.conn
+        self.connection()
             .extensions()
             .get_ref::<CapturedParams>()
             .map(|captured| captured.0.clone())
@@ -439,7 +458,7 @@ impl Lease {
     /// forwarder can route a client's `CancelRequest` to this backend while the
     /// lease is held. `None` if the backend issued no key.
     pub fn cancel_target(&self) -> Option<UpstreamCancel> {
-        self.conn
+        self.connection()
             .extensions()
             .get_ref::<CapturedCancel>()
             .map(|captured| captured.0.clone())
@@ -454,10 +473,10 @@ impl Lease {
     /// must leave the backend idle (`ReadyForQuery 'I'`). On any error the caller
     /// should [`discard`](Self::discard) the connection rather than pool it.
     pub async fn reset(&mut self, reset_frame: &[u8]) -> Result<(), BoxError> {
-        self.conn.write_all(reset_frame).await?;
-        self.conn.flush().await?;
+        self.connection_mut().write_all(reset_frame).await?;
+        self.connection_mut().flush().await?;
         loop {
-            let msg = read_message(&mut self.conn).await?;
+            let msg = read_message(self.connection_mut()).await?;
             match msg.tag() {
                 codec::READY_FOR_QUERY => {
                     return match msg.payload().first() {
@@ -471,33 +490,53 @@ impl Lease {
         }
     }
 
-    /// Return the connection to the pool (transaction completed, idle).
-    pub fn checkin(self) {
-        drop(self.conn); // LeasedConnection returns itself to the pool on drop.
+    /// Return the connection to the pool after verifying it is idle, with all
+    /// responses drained and any required session reset completed. This method
+    /// does not perform those protocol checks or reset work itself.
+    pub fn checkin(mut self) {
+        drop(self.conn.take()); // Only this path invokes the native return-on-drop.
     }
 
     /// Discard the connection (left mid-transaction); it is not pooled.
     pub fn discard(self) {
-        let _ = self.conn.into_connection();
+        drop(self);
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Rama transfers ownership out of its return-on-drop lease. Dropping
+            // that stream closes it instead of putting it back in idle storage.
+            drop(conn.into_connection());
+        }
     }
 }
 
 impl AsyncRead for Lease {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_read(cx, buf)
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().connection_mut()).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Lease {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().conn).poll_write(cx, buf)
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().connection_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+        Pin::new(self.get_mut().connection_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
+        Pin::new(self.get_mut().connection_mut()).poll_shutdown(cx)
     }
 }
