@@ -36,16 +36,14 @@ use rama::net::client::EstablishedClientConnection;
 use rama::net::client::pool::{
     ConnID, LeasedConnection, LruDropPool, PooledConnector, ReqToConnID,
 };
-use rama::tcp::{TcpStream, TokioTcpStream};
+use rama::tcp::TcpStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::cancel::UpstreamCancel;
+use crate::cancel::CancelTarget;
+use crate::connect::{BackendCancelTarget, BackendConnection, TcpBackendConnector};
 use crate::protocol::codec::{self, read_message};
 use crate::protocol::startup::CancelKey;
-
-/// The connection type the pool stores (rama's `TcpStream` carries the
-/// `Extensions` the pool and our captured params live in).
-type PooledStream = TcpStream;
+use crate::route::Backend;
 
 /// Pool key: `(user, database)` — the pgbouncer pooling unit — plus the chosen
 /// replica `shard`, so a connection is only reused for the same replica.
@@ -69,7 +67,7 @@ impl Extension for CapturedParams {}
 /// the connection so the pooled forwarder can route a client's cancel to whatever
 /// backend it is currently leasing.
 #[derive(Debug, Clone)]
-struct CapturedCancel(UpstreamCancel);
+struct CapturedCancel(Arc<dyn CancelTarget>);
 
 impl Extension for CapturedCancel {}
 
@@ -90,21 +88,23 @@ impl ExtensionsRef for BackendRequest {
 }
 
 /// Establishes a fresh backend: dial, replay the `StartupMessage`, drive the
-/// (trust) startup to `ReadyForQuery`, capturing `ParameterStatus`.
-struct PgConnector {
+/// startup/authentication to `ReadyForQuery`, capturing `ParameterStatus`.
+struct PgConnector<C> {
     credentials: Arc<dyn BackendCredentials>,
+    transport: C,
 }
 
-impl std::fmt::Debug for PgConnector {
+impl<C> std::fmt::Debug for PgConnector<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgConnector").finish_non_exhaustive()
     }
 }
 
-impl Clone for PgConnector {
+impl<C: Clone> Clone for PgConnector<C> {
     fn clone(&self) -> Self {
         Self {
             credentials: self.credentials.clone(),
+            transport: self.transport.clone(),
         }
     }
 }
@@ -115,7 +115,7 @@ const AUTH_CLEARTEXT_PASSWORD: i32 = 3;
 const AUTH_MD5_PASSWORD: i32 = 5;
 const AUTH_SASL: i32 = 10;
 
-impl PgConnector {
+impl<C> PgConnector<C> {
     /// The backend password for this request's role, erroring if a challenge
     /// arrived but no credentials are configured.
     async fn backend_password(&self, req: &BackendRequest) -> Result<String, BoxError> {
@@ -132,12 +132,24 @@ impl PgConnector {
     }
 }
 
-impl Service<BackendRequest> for PgConnector {
-    type Output = EstablishedClientConnection<PooledStream, BackendRequest>;
+impl<C, B, K> Service<BackendRequest> for PgConnector<C>
+where
+    C: Service<Backend, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    B: AsyncRead + AsyncWrite + Unpin + Send + Sync + ExtensionsRef + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>>,
+{
+    type Output = EstablishedClientConnection<B, BackendRequest>;
     type Error = BoxError;
 
     async fn serve(&self, req: BackendRequest) -> Result<Self::Output, Self::Error> {
-        let mut conn = TokioTcpStream::connect(&req.target).await?;
+        let BackendConnection {
+            mut conn,
+            cancellation,
+        } = self
+            .transport
+            .serve(Backend::new(req.target.clone()))
+            .await
+            .map_err(Into::into)?;
         conn.write_all(&req.startup).await?;
         conn.flush().await?;
 
@@ -200,13 +212,13 @@ impl Service<BackendRequest> for PgConnector {
             }
         }
 
-        let conn = TcpStream::new(conn);
         conn.extensions().insert(CapturedParams(params));
         if let Some(key) = cancel_key {
-            conn.extensions().insert(CapturedCancel(UpstreamCancel {
-                backend: req.target.clone(),
-                key,
-            }));
+            conn.extensions()
+                .insert(CapturedCancel(Arc::new(BackendCancelTarget {
+                    service: cancellation,
+                    key,
+                })));
         }
         Ok(EstablishedClientConnection { input: req, conn })
     }
@@ -286,12 +298,12 @@ impl ReqToConnID<BackendRequest> for RequestKey {
     }
 }
 
-type Connector = PooledConnector<PgConnector, LruDropPool<PooledStream, PgConnId>, RequestKey>;
+type Connector<C, B> = PooledConnector<PgConnector<C>, LruDropPool<B, PgConnId>, RequestKey>;
 
 /// When a leased backend is returned to the pool (pgbouncer-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PoolMode {
-    /// One backend per client connection, returned on disconnect.
+    /// One backend per client connection, discarded on disconnect.
     Session,
     /// A backend per transaction, returned at `ReadyForQuery` idle (the default).
     #[default]
@@ -303,7 +315,7 @@ pub enum PoolMode {
 
 /// A transaction-pooling backend pool that round-robins transactions across one
 /// or more equivalent replica addresses.
-pub struct BackendPool {
+pub struct BackendPool<C = TcpBackendConnector, B = TcpStream> {
     replicas: Vec<String>,
     mode: PoolMode,
     next: AtomicUsize,
@@ -315,7 +327,7 @@ pub struct BackendPool {
     /// statement modes), to clear leftover session state so it can't leak to the
     /// next client that reuses the connection. `None` disables the reset.
     reset_query: Option<BytesMut>,
-    connector: Connector,
+    connector: Connector<C, B>,
 }
 
 impl BackendPool {
@@ -334,6 +346,33 @@ impl BackendPool {
         max_size: usize,
         mode: PoolMode,
         credentials: Arc<dyn BackendCredentials>,
+    ) -> Arc<Self> {
+        Self::with_connector(
+            replicas,
+            max_size,
+            mode,
+            credentials,
+            TcpBackendConnector::default(),
+        )
+    }
+}
+
+impl<C, B, K> BackendPool<C, B>
+where
+    C: Service<Backend, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    B: AsyncRead + AsyncWrite + Unpin + Send + Sync + ExtensionsRef + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>>,
+{
+    /// Build a pool with caller-supplied transport establishment. The service
+    /// returns a stream and its cancellation service; PostgreSQL authentication
+    /// and reuse/reset policy remain in the pool. Streams carry Rama extensions
+    /// for per-connection metadata and are retained without boxing.
+    pub fn with_connector(
+        replicas: Vec<String>,
+        max_size: usize,
+        mode: PoolMode,
+        credentials: Arc<dyn BackendCredentials>,
+        transport: C,
     ) -> Arc<Self> {
         assert!(
             !replicas.is_empty(),
@@ -355,7 +394,14 @@ impl BackendPool {
             // `SET`/`PREPARE`/temp-table/`LISTEN` can't leak into the next.
             // `DISCARD ALL` is the safe default (it runs on standbys too).
             reset_query: Some(codec::frame(codec::QUERY, b"DISCARD ALL\0")),
-            connector: PooledConnector::new(PgConnector { credentials }, pool, RequestKey),
+            connector: PooledConnector::new(
+                PgConnector {
+                    credentials,
+                    transport,
+                },
+                pool,
+                RequestKey,
+            ),
         })
     }
 
@@ -407,7 +453,7 @@ impl BackendPool {
         startup_frame: &[u8],
         user: &str,
         database: &str,
-    ) -> Result<Lease, BoxError> {
+    ) -> Result<Lease<B>, BoxError> {
         let shard = self.next_replica();
         let req = BackendRequest {
             extensions: Extensions::new(),
@@ -430,18 +476,18 @@ impl BackendPool {
 /// `AsyncRead`/`AsyncWrite` stream; [`checkin`](Self::checkin) returns it to the
 /// pool, [`discard`](Self::discard) drops it. Dropping a lease without checkin
 /// also discards it, including task cancellation and unwinding.
-pub struct Lease {
+pub struct Lease<B: ExtensionsRef = TcpStream> {
     // Present while the lease can be borrowed. Taken only when checkin or Drop
     // consumes its ownership, preventing the native lease from auto-repooling.
-    conn: Option<LeasedConnection<PooledStream, PgConnId>>,
+    conn: Option<LeasedConnection<B, PgConnId>>,
 }
 
-impl Lease {
-    fn connection(&self) -> &LeasedConnection<PooledStream, PgConnId> {
+impl<B: ExtensionsRef> Lease<B> {
+    fn connection(&self) -> &LeasedConnection<B, PgConnId> {
         self.conn.as_ref().expect("live lease owns its connection")
     }
 
-    fn connection_mut(&mut self) -> &mut LeasedConnection<PooledStream, PgConnId> {
+    fn connection_mut(&mut self) -> &mut LeasedConnection<B, PgConnId> {
         self.conn.as_mut().expect("live lease owns its connection")
     }
 
@@ -454,10 +500,10 @@ impl Lease {
             .unwrap_or_default()
     }
 
-    /// The backend's cancel target (address + captured `BackendKeyData`), so the
+    /// The backend's connection-bound cancel target, so the
     /// forwarder can route a client's `CancelRequest` to this backend while the
     /// lease is held. `None` if the backend issued no key.
-    pub fn cancel_target(&self) -> Option<UpstreamCancel> {
+    pub fn cancel_target(&self) -> Option<Arc<dyn CancelTarget>> {
         self.connection()
             .extensions()
             .get_ref::<CapturedCancel>()
@@ -472,7 +518,10 @@ impl Lease {
     /// Must be called only at an idle transaction boundary, and the reset itself
     /// must leave the backend idle (`ReadyForQuery 'I'`). On any error the caller
     /// should [`discard`](Self::discard) the connection rather than pool it.
-    pub async fn reset(&mut self, reset_frame: &[u8]) -> Result<(), BoxError> {
+    pub async fn reset(&mut self, reset_frame: &[u8]) -> Result<(), BoxError>
+    where
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
         self.connection_mut().write_all(reset_frame).await?;
         self.connection_mut().flush().await?;
         loop {
@@ -503,7 +552,7 @@ impl Lease {
     }
 }
 
-impl Drop for Lease {
+impl<B: ExtensionsRef> Drop for Lease<B> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             // Rama transfers ownership out of its return-on-drop lease. Dropping
@@ -513,7 +562,7 @@ impl Drop for Lease {
     }
 }
 
-impl AsyncRead for Lease {
+impl<B: AsyncRead + Unpin + ExtensionsRef> AsyncRead for Lease<B> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -523,7 +572,7 @@ impl AsyncRead for Lease {
     }
 }
 
-impl AsyncWrite for Lease {
+impl<B: AsyncWrite + Unpin + ExtensionsRef> AsyncWrite for Lease<B> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

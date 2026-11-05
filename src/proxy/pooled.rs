@@ -5,30 +5,37 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rama::Service;
 use rama::error::BoxError;
+use rama::extensions::ExtensionsRef;
+use rama::tcp::TcpStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
 use super::{PgClient, reject, synthesize_startup};
 use crate::auth::ClientAuth;
 use crate::cancel::{CancelHandle, Cancellation};
+use crate::connect::{BackendConnection, TcpBackendConnector};
 use crate::pool::{BackendPool, Lease, PoolMode};
 use crate::protocol::codec;
 use crate::protocol::startup::CancelKey;
+use crate::route::Backend;
 
 /// Transaction-pooling forwarding (with round-robin replica sharding).
-pub struct PooledForwarder {
-    pool: Arc<BackendPool>,
+pub struct PooledForwarder<C = TcpBackendConnector, B = TcpStream> {
+    pool: Arc<BackendPool<C, B>>,
     cancellation: Arc<dyn Cancellation>,
 }
 
-impl PooledForwarder {
-    pub fn new(pool: Arc<BackendPool>, cancellation: Arc<dyn Cancellation>) -> Self {
+impl<C, B> PooledForwarder<C, B> {
+    pub fn new(pool: Arc<BackendPool<C, B>>, cancellation: Arc<dyn Cancellation>) -> Self {
         Self { pool, cancellation }
     }
 }
 
-impl<IO> Service<PgClient<IO>> for PooledForwarder
+impl<IO, C, B, K> Service<PgClient<IO>> for PooledForwarder<C, B>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: Service<Backend, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    B: AsyncRead + AsyncWrite + Unpin + Send + Sync + ExtensionsRef + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>>,
 {
     type Output = ();
     type Error = BoxError;
@@ -65,18 +72,21 @@ where
 
 /// Synthesize the startup completion, then run the pool's mode-specific relay.
 #[allow(clippy::too_many_arguments)]
-async fn serve_pooled<C>(
-    mut stream: C,
+async fn serve_pooled<IO, C, B, K>(
+    mut stream: IO,
     startup_frame: &[u8],
     user: &str,
     database: &str,
     outcome: ClientAuth,
-    pool: Arc<BackendPool>,
+    pool: Arc<BackendPool<C, B>>,
     client_key: Option<CancelKey>,
     handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Service<Backend, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    B: AsyncRead + AsyncWrite + Unpin + Send + Sync + ExtensionsRef + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>>,
 {
     if matches!(outcome, ClientAuth::PassThrough) {
         return reject(
@@ -95,7 +105,12 @@ where
         Ok(params) => params,
         Err(err) => {
             tracing::error!(%err, "backend connection/authentication failed");
-            return reject(&mut stream, "08006", "rama-pg: could not establish a backend connection").await;
+            return reject(
+                &mut stream,
+                "08006",
+                "rama-pg: could not establish a backend connection",
+            )
+            .await;
         }
     };
     // Advertise the cancel key the provider issued, or a throwaway one when disabled.
@@ -110,7 +125,7 @@ where
             let mut lease = pool.lease(startup_frame, user, database).await?;
             // Point cancellation at this backend for the life of the session.
             if let Some(target) = lease.cancel_target() {
-                handle.set(Arc::new(target));
+                handle.set(target);
             }
             let outcome = copy_bidirectional(&mut stream, &mut lease).await;
             handle.clear();
@@ -120,7 +135,11 @@ where
             // (Real session-pool *reuse* needs a `DISCARD ALL` reset hook.)
             lease.discard();
             let (client_to_backend, backend_to_client) = outcome?;
-            tracing::info!(client_to_backend, backend_to_client, "session-pooled connection closed");
+            tracing::info!(
+                client_to_backend,
+                backend_to_client,
+                "session-pooled connection closed"
+            );
             Ok(())
         }
         mode => relay_pooled(stream, startup_frame, user, database, pool, mode, handle).await,
@@ -129,17 +148,20 @@ where
 
 /// Transaction/statement pooling: lease a backend per transaction (or
 /// statement) and run it to its release boundary via [`run_lease`].
-async fn relay_pooled<C>(
-    stream: C,
+async fn relay_pooled<IO, C, B, K>(
+    stream: IO,
     startup_frame: &[u8],
     user: &str,
     database: &str,
-    pool: Arc<BackendPool>,
+    pool: Arc<BackendPool<C, B>>,
     mode: PoolMode,
     handle: &CancelHandle,
 ) -> Result<(), BoxError>
 where
-    C: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Service<Backend, Output = BackendConnection<B, K>, Error: Into<BoxError>>,
+    B: AsyncRead + AsyncWrite + Unpin + Send + Sync + ExtensionsRef + 'static,
+    K: Service<CancelKey, Output = (), Error: Into<BoxError>>,
 {
     // The reset query (e.g. DISCARD ALL) is replayed to a backend before it
     // returns to the pool; capture it once so each transaction can reuse it.
@@ -158,9 +180,10 @@ where
         // Route cancellation at this backend while the client holds the lease;
         // clear it once the transaction is done (the client is idle again).
         if let Some(target) = lease.cancel_target() {
-            handle.set(Arc::new(target));
+            handle.set(target);
         }
-        let keep_serving = run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await;
+        let keep_serving =
+            run_lease(&mut client, lease, first.as_bytes(), mode, reset.as_deref()).await;
         handle.clear();
         if !keep_serving? {
             break; // client gone
@@ -186,15 +209,16 @@ where
 /// can't leak across clients sharing the backend.
 ///
 /// Returns `Ok(true)` to keep serving the client, `Ok(false)` once it has gone.
-async fn run_lease<C>(
+async fn run_lease<C, B>(
     client: &mut codec::FramedReader<C>,
-    mut lease: Lease,
+    mut lease: Lease<B>,
     first: &[u8],
     mode: PoolMode,
     reset: Option<&[u8]>,
 ) -> Result<bool, BoxError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
 {
     // Forward the first frame of the transaction/statement.
     if let Err(err) = forward_first(&mut lease, first).await {
@@ -244,7 +268,10 @@ where
 
 /// Write the first client frame to the backend (split out so [`run_lease`] can
 /// discard the lease on a write error).
-async fn forward_first(lease: &mut Lease, frame: &[u8]) -> Result<(), BoxError> {
+async fn forward_first<B>(lease: &mut Lease<B>, frame: &[u8]) -> Result<(), BoxError>
+where
+    B: AsyncWrite + Unpin + ExtensionsRef,
+{
     lease.write_all(frame).await?;
     lease.flush().await?;
     Ok(())

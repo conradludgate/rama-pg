@@ -71,9 +71,14 @@ These are follow-ups, not claims that the first integration implements them:
    accept any owned target and return BackendConnection with its stream and a
    cloneable cancellation service. The TCP default uses Rama's non-HTTP connect
    primitive and pins cancellation to the connected peer. Custom policies can
-   layer DNS/TLS/deadlines and carry tenant-specific target metadata. Next apply
-   this establishment boundary to pooled backends without folding pool lifecycle
-   or PgBouncer configuration into the transport service.
+   layer DNS/TLS/deadlines and carry tenant-specific target metadata. Pooled
+   backends now reuse this boundary through `BackendPool::with_connector` and
+   `PooledForwarder`; the pool passes its selected replica as `Backend`. Pool
+   authentication, reset and reuse remain separate from transport establishment.
+   Concrete pooled streams carry Rama extensions and are not boxed. Cancellation
+   targets are shared per backend, so pooled connectors and cancellation services
+   need not be cloneable. A dropped lease discards its stream; only explicit
+   `checkin` returns a drained, reset connection to idle storage.
 2. **Layered resource policy.** Thread application-selected frame budgets through
    built-in forwarders/authentication. Use Rama layers for concurrency and time
    budgets; account separately for session and pool state. Preserve opaque
