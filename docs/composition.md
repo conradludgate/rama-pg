@@ -67,7 +67,9 @@ startup, rather than decoding every message.
 These are follow-ups, not claims that the first integration implements them:
 
 1. **Rama-native backend establishment.** Direct forwarding still uses a fixed
-   SNI router and a Tokio TCP dial. Separate target selection and connection
+   SNI policy by default and a Tokio TCP dial. DirectForwarder now accepts a
+   routing Service<PgClient<IO>>; custom policies can use all startup metadata
+   without cloning it. Next separate connection
    establishment using Rama services/connectors. Allow startup metadata to
    select a target and caller layers to configure DNS, timeouts, backend TLS and
    observability. Cancellation must follow the actual selected backend.

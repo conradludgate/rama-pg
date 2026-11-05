@@ -120,6 +120,30 @@ boxing is optional. PgBouncer's configuration and policies remain in the showcas
 Each guide changes one input to the `PgProxy` from the tutorial. They cover the
 library's extension seams; types are detailed in [Reference](#reference).
 
+### Route using startup metadata
+
+`Router` is the default static SNI policy. `DirectForwarder::new` also accepts an
+ordinary Rama service over `PgClient<IO>`, returning `(client, Option<Backend>)`.
+A routing service can inspect startup user/database, SNI and authentication,
+await a policy lookup, and return the same owned client without copying startup
+parameters. `None` produces SQLSTATE `08004`; policy errors propagate as errors.
+
+```rust
+use rama::service::service_fn;
+use rama_pg::{proxy::{DirectForwarder, PgClient}, route::Backend};
+
+let routes = service_fn(|client: PgClient<MyTransport>| async move {
+    let backend = lookup_backend(client.startup.user(), client.startup.database()).await?;
+    Ok::<_, MyError>((client, backend.map(Backend::new)))
+});
+let forwarder = DirectForwarder::new(routes, cancellation);
+// Compose `forwarder` with PgSession or PgProxy::with_forwarder.
+```
+
+The service owns the client while routing; cancellation/drop releases that
+connection instead of leaving detached routing work. Layers can surround the
+routing service just as they surround the forwarder.
+
 ### Terminate cleartext password auth
 
 Swap the authenticator. The proxy challenges the client for a cleartext password
