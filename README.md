@@ -96,6 +96,8 @@ in-proxy query mode by changing the values you pass to `PgProxy`.
 
 ## Compose the session layer directly
 
+[Composition boundaries and integration direction](docs/composition.md).
+
 `PgProxy` provides the standard PostgreSQL TLS negotiation entry point. For a
 custom transport or TLS stack, compose the public `PgSession::new(auth,
 forwarder, cancellation)` service behind your own acceptor instead. It accepts
